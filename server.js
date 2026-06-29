@@ -16,6 +16,14 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
+const { solvePOW } = require('./lib/pow');
+
+// Per-DeepSeek-request network timeout. Plain fetch() has NO default timeout, so a
+// stalled upstream would hang the inbound request (and pin the account) forever.
+const DS_FETCH_TIMEOUT_MS = Number(process.env.DEEPSEEK_FETCH_TIMEOUT_MS || 60000);
+function dsFetch(url, options = {}, timeoutMs = DS_FETCH_TIMEOUT_MS) {
+    return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
+}
 
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
 const SERVER_PUBLIC_IP = (() => {
@@ -224,28 +232,8 @@ function getOrCreateAgentSession(agentId) {
     return sessions.get(agentId);
 }
 
-async function solvePOW(challenge, config = DS_CONFIG) {
-    const resp = await fetch(config.wasmUrl);
-    const wasmBytes = await resp.arrayBuffer();
-    const mod = await WebAssembly.instantiate(wasmBytes, { wbg: {} });
-    const e = mod.instance.exports;
-    const encoder = new TextEncoder();
-    const prefix = challenge.salt + '_' + challenge.expire_at + '_';
-    const cBytes = encoder.encode(challenge.challenge);
-    const pBytes = encoder.encode(prefix);
-    const cP = e.__wbindgen_export_0(cBytes.length, 1) >>> 0;
-    const pP = e.__wbindgen_export_0(pBytes.length, 1) >>> 0;
-    new Uint8Array(e.memory.buffer, cP, cBytes.length).set(cBytes);
-    new Uint8Array(e.memory.buffer, pP, pBytes.length).set(pBytes);
-    const sp = e.__wbindgen_add_to_stack_pointer(-16);
-    e.wasm_solve(sp, cP, cBytes.length, pP, pBytes.length, challenge.difficulty);
-    const dv = new DataView(e.memory.buffer);
-    const code = dv.getInt32(sp, true);
-    const ans = dv.getFloat64(sp + 8, true);
-    e.__wbindgen_add_to_stack_pointer(16);
-    if (code === 0 || !Number.isFinite(ans) || ans <= 0) throw new Error('POW failed');
-    return Math.floor(ans);
-}
+// solvePOW() lives in lib/pow (compiled-module cache + WASM-fetch timeout),
+// shared with client.js. Called as solvePOW(challenge, wasmUrl).
 
 const MODEL_CONFIGS = {
     // DeepSeek Web real model_type: default / UI name: "Быстрый".
@@ -421,7 +409,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         session.messageCount = 0;
     }
 
-    const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
+    const cr = await dsFetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
         method: 'POST', headers: dsHeaders,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
@@ -437,10 +425,10 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     if (!challenge) {
         throw new Error('DeepSeek PoW response has no data.biz_data.challenge. Auth may be expired, captcha may be required, or DeepSeek changed Web API. Run npm run doctor, then npm run auth.');
     }
-    const answer = await solvePOW(challenge, account.config);
+    const answer = await solvePOW(challenge, account.config.wasmUrl);
 
     if (!session.id) {
-        const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
+        const sr = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
             method: 'POST', headers: dsHeaders, body: '{}'
         });
         const { json: sessionData, text: sessionText } = await readDeepSeekJsonResponse(sr, 'session create', account);
@@ -463,7 +451,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         salt: challenge.salt, answer: answer,
         signature: challenge.signature, target_path: '/api/v0/chat/completion'
     })).toString('base64');
-    const resp = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
+    const resp = await dsFetch('https://chat.deepseek.com/api/v0/chat/completion', {
         method: 'POST',
         headers: { ...dsHeaders, 'X-DS-PoW-Response': powB64 },
         body: JSON.stringify({
@@ -489,7 +477,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             session.createdAt = null;
             session.messageCount = 0;
 
-            const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
+            const sr2 = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                 method: 'POST', headers: dsHeaders, body: '{}'
             });
             const { json: sessionData2, text: sessionText2 } = await readDeepSeekJsonResponse(sr2, 'session recreate', account);
@@ -508,7 +496,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
                 salt: challenge.salt, answer: answer,
                 signature: challenge.signature, target_path: '/api/v0/chat/completion'
             })).toString('base64');
-            const resp2 = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
+            const resp2 = await dsFetch('https://chat.deepseek.com/api/v0/chat/completion', {
                 method: 'POST',
                 headers: { ...dsHeaders, 'X-DS-PoW-Response': newPowB64 },
                 body: JSON.stringify({
@@ -1311,8 +1299,9 @@ const server = http.createServer(async (req, res) => {
                     rebuildFragmentState();
                 };
 
+                const decoder = new TextDecoder();  // one instance: preserves multi-byte (Cyrillic/emoji) split across chunks
                 for await (const chunk of readable) {
-                    buffer += new TextDecoder().decode(chunk, { stream: true });
+                    buffer += decoder.decode(chunk, { stream: true });
                     const lines = buffer.split('\n');
                     buffer = lines.pop() || '';
                     for (const line of lines) {
