@@ -209,6 +209,54 @@ test('proxy API key authentication is optional and uses exact bearer tokens', ()
   assert.equal(serverInternals.isProxyAuthorized('Bearer secret ', 'secret'), false);
 });
 
+test('proxy API key can be loaded from a mounted secret and required explicitly', () => {
+  const dir = tmpdir();
+  const secretPath = path.join(dir, 'proxy-api-key');
+  fs.writeFileSync(secretPath, 'mounted-secret\n');
+
+  assert.equal(serverInternals.loadProxyApiKey({ PROXY_API_KEY_FILE: secretPath }), 'mounted-secret');
+  assert.equal(serverInternals.loadProxyApiKey({ PROXY_API_KEY: 'env-secret', PROXY_API_KEY_FILE: secretPath }), 'env-secret');
+  assert.equal(serverInternals.loadProxyApiKey({ PROXY_API_KEY_FILE: path.join(dir, 'missing') }), '');
+  assert.doesNotThrow(() => serverInternals.requireProxyApiKey('mounted-secret', true));
+  assert.throws(
+    () => serverInternals.requireProxyApiKey('', true),
+    /PROXY_API_KEY is required/,
+  );
+});
+
+test('Containerfile keeps the rootless Podman runtime minimal and fail-closed', () => {
+  const containerfile = fs.readFileSync(path.join(ROOT, 'Containerfile'), 'utf8');
+  const containerignore = fs.readFileSync(path.join(ROOT, '.containerignore'), 'utf8');
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const copyLines = containerfile
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.startsWith('COPY '));
+
+  assert.deepEqual(copyLines, [
+    'COPY --chown=1000:1000 package.json server.js ./',
+    'COPY --chown=1000:1000 lib/pow.js ./lib/pow.js',
+  ]);
+  assert.doesNotMatch(containerfile, /^\s*(?:COPY|ADD)\s+\.\s/m);
+  assert.match(containerfile, /^USER 1000:1000$/m);
+  assert.match(containerfile, /HOST=0\.0\.0\.0/);
+  assert.match(containerfile, /NON_INTERACTIVE=1/);
+  assert.match(containerfile, /REQUIRE_PROXY_API_KEY=1/);
+  assert.match(containerfile, /PROXY_API_KEY_FILE=\/run\/secrets\/proxy-api-key/);
+  assert.match(containerfile, /^HEALTHCHECK /m);
+  assert.match(containerfile, /path:'\/health'/);
+  assert.match(containerfile, /^CMD \["node", "server\.js"\]$/m);
+
+  assert.match(containerignore, /^\*$/m);
+  assert.doesNotMatch(containerignore, /^!.*(?:auth|secret|\.env)/mi);
+  assert.match(readme, /--publish 127\.0\.0\.1:9655:9655/);
+  assert.match(readme, /--secret free-deepseek-auth[^\n]*mode=0400/);
+  assert.match(readme, /--secret free-deepseek-proxy-key[^\n]*mode=0400/);
+  assert.match(readme, /--read-only/);
+  assert.match(readme, /--cap-drop=ALL/);
+  assert.match(readme, /--security-opt=no-new-privileges/);
+});
+
 test('loopback host detection covers supported local bind addresses', () => {
   assert.equal(serverInternals.isLoopbackHost('127.0.0.1'), true);
   assert.equal(serverInternals.isLoopbackHost('::1'), true);

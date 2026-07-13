@@ -38,6 +38,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - [Windows запуск](#-windows-запуск)
 - [Linux / Chromium запуск](#-linux--chromium-запуск)
 - [VPS / headless запуск](#-vps--headless-запуск)
+- [Rootless Podman](#-rootless-podman)
 - [Diagnostics / doctor](#-diagnostics--doctor)
 - [Session reuse и сброс чатов](#-session-reuse-и-сброс-чатов)
 - [Multi-account pool](#-multi-account-pool)
@@ -214,6 +215,89 @@ DEEPSEEK_TOKEN="<token>" npm run auth:import -- --input ./cookies.json
 ```
 
 > Важно: `deepseek-auth.json` — это доступ к вашему DeepSeek Web login. Не коммитьте, не публикуйте, храните с правами `0600`.
+
+---
+
+## 🦭 Rootless Podman
+
+Контейнер предназначен только для non-interactive запуска proxy. Авторизацию
+через браузер выполните на хосте командой `npm run auth`: auth-скрипты и
+`deepseek-auth.json` в образ не копируются.
+
+Запускайте Podman обычным пользователем, без `sudo`.
+
+1. Соберите локальный образ:
+
+```bash
+podman build --tag localhost/free-deepseek-api:local --file Containerfile .
+```
+
+2. Передайте DeepSeek auth и отдельный ключ proxy через Podman secrets:
+
+```bash
+podman secret create --replace free-deepseek-auth ./deepseek-auth.json
+
+printf 'Proxy API key: '
+IFS= read -r -s PROXY_API_KEY
+printf '\n'
+printf '%s' "$PROXY_API_KEY" |
+  podman secret create --replace free-deepseek-proxy-key -
+```
+
+Используйте длинный случайный ключ. Значение останется в переменной
+`PROXY_API_KEY` текущего shell, чтобы проверить API; оно не попадает в образ или
+командную строку Podman.
+
+3. Запустите контейнер с минимальными привилегиями:
+
+```bash
+podman run --detach \
+  --name free-deepseek-api \
+  --publish 127.0.0.1:9655:9655 \
+  --secret free-deepseek-auth,target=deepseek-auth.json,uid=1000,gid=1000,mode=0400 \
+  --secret free-deepseek-proxy-key,target=proxy-api-key,uid=1000,gid=1000,mode=0400 \
+  --read-only \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  localhost/free-deepseek-api:local
+```
+
+Внутри контейнера заранее выставлены `NON_INTERACTIVE=1`, `HOST=0.0.0.0` и
+пути к обоим secrets. `REQUIRE_PROXY_API_KEY=1` не даст контейнеру запуститься,
+если secret с ключом отсутствует или пуст. На хосте порт публикуется только на
+`127.0.0.1`; не убирайте этот адрес без отдельного сетевого firewall/access
+policy.
+
+4. Проверьте liveness, readiness аккаунта и защищённый endpoint:
+
+```bash
+podman healthcheck run free-deepseek-api
+curl --fail http://127.0.0.1:9655/readyz
+curl --fail \
+  -H "Authorization: Bearer $PROXY_API_KEY" \
+  http://127.0.0.1:9655/v1/models
+```
+
+Встроенный healthcheck проверяет локальный `/health` (жив ли процесс).
+`/readyz` дополнительно вернёт `503`, если ни один DeepSeek auth-аккаунт сейчас
+не готов обслуживать запросы. Диагностика контейнера:
+
+```bash
+podman logs free-deepseek-api
+podman inspect --format '{{.State.Health.Status}}' free-deepseek-api
+```
+
+Остановка и удаление контейнера вместе с сохранёнными Podman secrets:
+
+```bash
+podman stop free-deepseek-api
+podman rm free-deepseek-api
+podman secret rm free-deepseek-auth free-deepseek-proxy-key
+unset PROXY_API_KEY
+```
+
+При ротации auth или proxy key замените соответствующий secret и пересоздайте
+контейнер, чтобы поведение не зависело от версии Podman.
 
 ---
 

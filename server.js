@@ -42,7 +42,28 @@ const SERVER_PUBLIC_IP = (() => {
 const FORGETMEAI_WATERMARK = 't.me/forgetmeai';
 const PORT = Number(process.env.PORT || 9655);
 const HOST = process.env.HOST || '127.0.0.1';
-const PROXY_API_KEY = String(process.env.PROXY_API_KEY || '');
+
+function loadProxyApiKey(env = process.env) {
+    if (env.PROXY_API_KEY) return String(env.PROXY_API_KEY);
+    const secretPath = String(env.PROXY_API_KEY_FILE || '').trim();
+    if (!secretPath) return '';
+    try {
+        return fs.readFileSync(secretPath, 'utf8').trim();
+    } catch (error) {
+        // A missing optional secret is equivalent to an unset key. Container
+        // deployments set REQUIRE_PROXY_API_KEY=1 and fail closed in main().
+        if (error.code === 'ENOENT') return '';
+        throw new Error(`Could not read PROXY_API_KEY_FILE (${secretPath}): ${error.message}`);
+    }
+}
+
+function requireProxyApiKey(key, required) {
+    if (required && !key) {
+        throw new Error('PROXY_API_KEY is required. Set PROXY_API_KEY or mount a secret and set PROXY_API_KEY_FILE.');
+    }
+}
+
+const PROXY_API_KEY = loadProxyApiKey();
 const PROXY_CORS_ORIGINS = new Set(String(process.env.PROXY_CORS_ORIGINS || '')
     .split(',')
     .map(value => normalizeOrigin(value))
@@ -2366,6 +2387,7 @@ async function showStartupMenu() {
 
 async function main() {
     printBanner();
+    requireProxyApiKey(PROXY_API_KEY, isTruthy(process.env.REQUIRE_PROXY_API_KEY));
     if (!isLoopbackHost(HOST) && !PROXY_API_KEY) {
         console.warn(`[DS-API] WARNING: HOST=${HOST} exposes the proxy without authentication. Set PROXY_API_KEY or bind to 127.0.0.1.`);
     }
@@ -2439,6 +2461,8 @@ module.exports = {
         accounts,
         selectAccountForSession,
         isProxyAuthorized,
+        loadProxyApiKey,
+        requireProxyApiKey,
         isLoopbackHost,
         normalizeOrigin,
         isBrowserOriginAllowed,
