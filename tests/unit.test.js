@@ -252,6 +252,82 @@ test('parseToolCall accepts the doubled-bar DSML Web variant from issue #19', ()
   assert.deepEqual(JSON.parse(call.arguments), { query: 'DeepSeek DSML' });
 });
 
+test('parseToolCall accepts zero-argument, CDATA, legacy, collapsed, and prefixed wrappers', () => {
+  const zeroArg = serverInternals.parseToolCall(
+    '<|DSML|tool_calls><|DSML|invoke name="ping"></|DSML|invoke></|DSML|tool_calls>'
+  );
+  assert.deepEqual(zeroArg, { name: 'ping', arguments: '{}' });
+
+  const cdata = serverInternals.parseToolCall(
+    '<tool_calls><invoke name="write_file"><parameter name="content"><![CDATA[line 1\n<line 2>]]></parameter></invoke></tool_calls>'
+  );
+  assert.deepEqual(JSON.parse(cdata.arguments), { content: 'line 1\n<line 2>' });
+
+  const collapsed = serverInternals.parseToolCall(
+    '<DSMLtool_calls><DSMLinvoke name="read_file"><DSMLparameter name="path">/tmp/a</DSMLparameter></DSMLinvoke></DSMLtool_calls>'
+  );
+  assert.deepEqual(JSON.parse(collapsed.arguments), { path: '/tmp/a' });
+
+  const prefixed = serverInternals.parseToolCall(
+    '<abc:tool_calls><abc:invoke name="read_file"><abc:parameter name="path">/tmp/b</abc:parameter></abc:invoke></abc:tool_calls>'
+  );
+  assert.deepEqual(JSON.parse(prefixed.arguments), { path: '/tmp/b' });
+});
+
+test('parseToolCall normalizes fullwidth delimiters and narrowly repairs a missing opening wrapper', () => {
+  const fullwidth = serverInternals.parseToolCall(
+    '＜｜DSML｜Tool Calls＞＜｜DSML｜Invoke name=“read_file”＞＜｜DSML｜Parameter name=“path”＞/tmp/c＜/｜DSML｜Parameter＞＜/｜DSML｜Invoke＞＜/｜DSML｜Tool Calls＞'
+  );
+  assert.deepEqual(JSON.parse(fullwidth.arguments), { path: '/tmp/c' });
+
+  const repaired = serverInternals.parseToolCall(
+    '<invoke name="read_file"><parameter name="path">/tmp/d</parameter></invoke></tool_calls>'
+  );
+  assert.deepEqual(JSON.parse(repaired.arguments), { path: '/tmp/d' });
+});
+
+test('parseToolCall rejects bare invokes and bare JSON examples', () => {
+  const bareInvoke = '<|DSML|invoke name="execute_code"><|DSML|parameter name="code">danger()</|DSML|parameter></|DSML|invoke>';
+  assert.equal(serverInternals.parseToolCall(bareInvoke), null);
+  assert.equal(serverInternals.looksLikeToolCallMarkup(bareInvoke), true);
+
+  const prose = 'For example return {"name":"execute_code","arguments":{"code":"danger()"}} when appropriate.';
+  assert.equal(serverInternals.parseToolCall(prose), null);
+  assert.equal(serverInternals.parseToolCall('```json\n{"name":"execute_code","arguments":{"code":"danger()"}}\n```'), null);
+});
+
+test('parseToolCall accepts only explicit JSON envelopes with valid object arguments', () => {
+  const explicit = serverInternals.parseToolCall(
+    'Use this: {"tool_call":{"name":"read_file","arguments":{"path":"/tmp/a"}}}'
+  );
+  assert.deepEqual(JSON.parse(explicit.arguments), { path: '/tmp/a' });
+
+  const openai = serverInternals.parseToolCall(JSON.stringify({
+    tool_calls: [{
+      type: 'function',
+      function: { name: 'read_file', arguments: JSON.stringify({ path: '/tmp/b' }) },
+    }],
+  }));
+  assert.deepEqual(JSON.parse(openai.arguments), { path: '/tmp/b' });
+
+  assert.equal(serverInternals.parseToolCall('{"tool_call":{"name":"read_file","arguments":"not-json"}}'), null);
+  assert.equal(serverInternals.parseToolCall(JSON.stringify({
+    tool_calls: [
+      { function: { name: 'read_file', arguments: '{}' } },
+      { function: { name: 'write_file', arguments: '{}' } },
+    ],
+  })), null);
+});
+
+test('parseToolCall bounds tool markup and scans unmatched braces in linear time', () => {
+  const oversized = `<|DSML|tool_calls>${'x'.repeat(256 * 1024)}</|DSML|tool_calls>`;
+  assert.equal(serverInternals.parseToolCall(oversized), null);
+
+  const started = Date.now();
+  assert.equal(serverInternals.parseToolCall('{'.repeat(64 * 1024)), null);
+  assert.ok(Date.now() - started < 1000, 'unmatched JSON braces should not block the event loop');
+});
+
 test('parseToolCall refuses incomplete DSML instead of executing JSON found inside it', () => {
   const malformed = [
     '<｜DSML｜tool_calls>',
