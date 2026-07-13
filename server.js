@@ -93,7 +93,15 @@ let inFlight = 0;  // concurrent in-flight completions (backpressure cap)
 // loops), max concurrent completions, and the empty-response retry cap.
 const REQUEST_DEADLINE_MS = Number(process.env.DEEPSEEK_REQUEST_DEADLINE_MS || 120000);
 const MAX_CONCURRENT = Number(process.env.DEEPSEEK_MAX_CONCURRENT || 24);
-const MAX_EMPTY_RETRIES = Number(process.env.DEEPSEEK_MAX_RETRIES || 4);
+const configuredEmptyRetries = Number(process.env.DEEPSEEK_MAX_RETRIES);
+const MAX_EMPTY_RETRIES = Number.isFinite(configuredEmptyRetries)
+    ? Math.max(0, Math.min(10, Math.floor(configuredEmptyRetries)))
+    : 2;
+const MIN_UPSTREAM_PROMPT_CHARS = 16000;
+const configuredPromptChars = Number(process.env.DEEPSEEK_MAX_PROMPT_CHARS);
+const MAX_UPSTREAM_PROMPT_CHARS = Number.isFinite(configuredPromptChars)
+    ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredPromptChars))
+    : 80000;
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -558,8 +566,26 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
 
 // === Tool Calling Support ===
 
+function compactToolSchema(value) {
+    if (Array.isArray(value)) return value.map(compactToolSchema);
+    if (!value || typeof value !== 'object') return value;
+    const compact = {};
+    for (const [key, child] of Object.entries(value)) {
+        // Descriptions/examples dominate large agent tool payloads but do not
+        // affect argument validation. Keep the structural schema intact.
+        if (key === 'description' || key === 'examples' || key === '$comment' || key === 'title') continue;
+        compact[key] = compactToolSchema(child);
+    }
+    return compact;
+}
+
 function formatToolDefinitions(tools) {
     if (!tools || tools.length === 0) return '';
+    const rawSchemaChars = tools.reduce((total, tool) => {
+        try { return total + JSON.stringify(tool?.function?.parameters || {}).length; }
+        catch (e) { return total; }
+    }, 0);
+    const compactSchemas = rawSchemaChars > Math.floor(MAX_UPSTREAM_PROMPT_CHARS * 0.4);
     let text = '\n\n--- TOOL REQUEST SYSTEM ---\n';
     text += 'You are an AI that ONLY REASONS and REQUESTS tool executions. You do NOT run any commands yourself.\n';
     text += 'When you need data from the local server, REQUEST exactly one tool call. Prefer strict JSON:\n';
@@ -578,9 +604,10 @@ function formatToolDefinitions(tools) {
         if (tool.type === 'function' && tool.function) {
             const fn = tool.function;
             text += `\n## ${fn.name}\n`;
-            text += `${fn.description || ''}\n`;
+            const description = String(fn.description || '').replace(/\s+/g, ' ').trim();
+            text += `${description.length > 500 ? description.substring(0, 497) + '...' : description}\n`;
             if (fn.parameters) {
-                text += `Parameters: ${JSON.stringify(fn.parameters)}\n`;
+                text += `Parameters: ${JSON.stringify(compactSchemas ? compactToolSchema(fn.parameters) : fn.parameters)}\n`;
             }
         }
     }
@@ -639,8 +666,110 @@ function parseJsonToolCandidate(raw, label = 'json') {
     return null;
 }
 
+function normalizeDsmlTags(text) {
+    return String(text || '').replace(
+        /<\s*(\/?)\s*[|｜]+\s*DSML\s*[|｜]+\s*([^>]*)>/giu,
+        (_match, closing, suffix) => {
+            const trimmed = String(suffix || '').trim();
+            return `<${closing ? '/' : ''}|DSML|${trimmed ? ` ${trimmed}` : ''}>`;
+        }
+    );
+}
+
+function decodeDsmlValue(value) {
+    return String(value || '')
+        .replace(/&quot;/gi, '"')
+        .replace(/&apos;/gi, "'")
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&amp;/gi, '&');
+}
+
+function parseDsmlInvoke(name, body) {
+    if (!name || !/^[A-Za-z0-9_.:-]+$/.test(name)) return null;
+    const args = {};
+    let parameterCount = 0;
+    const parameterRe = /<\|DSML\|\s*parameter\b([^>]*)>([\s\S]*?)<\/\|DSML\|\s*parameter\s*>/gi;
+    let parameterMatch;
+    while ((parameterMatch = parameterRe.exec(body)) !== null) {
+        const attrs = parameterMatch[1] || '';
+        const nameMatch = attrs.match(/\bname\s*=\s*(["'])([^"']+)\1/i);
+        if (!nameMatch) continue;
+        const stringMatch = attrs.match(/\bstring\s*=\s*(["'])(true|false)\1/i);
+        const rawValue = decodeDsmlValue(parameterMatch[2]);
+        let value = rawValue;
+        if (!stringMatch || stringMatch[2].toLowerCase() === 'false') {
+            try { value = JSON.parse(rawValue.trim()); } catch (e) { value = rawValue; }
+        }
+        args[nameMatch[2]] = value;
+        parameterCount++;
+    }
+    if (parameterCount > 0) return { name, arguments: JSON.stringify(args) };
+
+    // Some DeepSeek Web responses use a shortened DSML invoke whose body is
+    // already a JSON object instead of parameter elements.
+    const decodedBody = decodeDsmlValue(body).trim();
+    const braceIndex = decodedBody.indexOf('{');
+    if (braceIndex !== -1) {
+        const rawJson = extractBalancedJsonAt(decodedBody, braceIndex);
+        if (rawJson) {
+            try {
+                const parsed = JSON.parse(rawJson);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    return { name, arguments: JSON.stringify(parsed) };
+                }
+            } catch (e) { }
+        }
+    }
+    return null;
+}
+
+function parseDsmlToolCall(text) {
+    const normalized = normalizeDsmlTags(text);
+    const toolBlockRe = /<\|DSML\|\s*(?:tool[\s_-]*calls|function[\s_-]*calls)\s*>([\s\S]*?)<\/\|DSML\|\s*(?:tool[\s_-]*calls|function[\s_-]*calls)\s*>/i;
+    const toolBlock = toolBlockRe.exec(normalized);
+    const scope = toolBlock ? toolBlock[1] : normalized;
+    const invokeRe = /<\|DSML\|\s*(?:invoke\s+)?name\s*=\s*(["'])([^"']+)\1[^>]*>([\s\S]*?)<\/\|DSML\|\s*(?:invoke)?\s*>/gi;
+    let invokeMatch;
+    while ((invokeMatch = invokeRe.exec(scope)) !== null) {
+        const parsed = parseDsmlInvoke(invokeMatch[2], invokeMatch[3]);
+        if (parsed) {
+            console.log(`[parseToolCall] SUCCESS dsml: ${parsed.name} (args=${parsed.arguments.length} chars)`);
+            return parsed;
+        }
+    }
+
+    // Seen in DeepSeek Web: <｜｜DSML｜｜ Tool Calls> followed by a direct
+    // <｜｜DSML｜｜ name="tool"> JSON body, with no separate invoke close tag.
+    // Only accept this tolerant form inside a complete Tool Calls wrapper.
+    if (toolBlock) {
+        const directMatch = scope.match(/<\|DSML\|\s*name\s*=\s*(["'])([^"']+)\1[^>]*>([\s\S]*)$/i);
+        if (directMatch) {
+            const parsed = parseDsmlInvoke(directMatch[2], directMatch[3]);
+            if (parsed) {
+                console.log(`[parseToolCall] SUCCESS dsml-direct: ${parsed.name} (args=${parsed.arguments.length} chars)`);
+                return parsed;
+            }
+        }
+    }
+    return null;
+}
+
+function looksLikeToolCallMarkup(text) {
+    return /TOOL_CALL:\s*[\w-]+|<tool_call\b|[|｜]+\s*DSML\s*[|｜]+/i.test(String(text || ''));
+}
+
 function parseToolCall(text) {
     if (!text || typeof text !== 'string') return null;
+
+    if (/[|｜]+\s*DSML\s*[|｜]+/i.test(text)) {
+        const dsml = parseDsmlToolCall(text);
+        if (dsml) return dsml;
+        console.log('[parseToolCall] DSML markup found but invoke was incomplete or malformed');
+        // Do not scan JSON inside malformed DSML as a standalone tool call: a
+        // normal argument named "name" could otherwise execute the wrong tool.
+        return null;
+    }
 
     // XML-ish wrappers used by some agent prompts.
     const xmlMatch = text.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
@@ -1115,11 +1244,86 @@ function extractScreenshotPaths(messages) {
     return paths;
 }
 
+const PROMPT_COMPACTION_MARKER = '\n\n[Earlier context compacted by FreeDeepseekAPI]\n\n';
+
+function truncatePromptMiddle(text, maxChars, headRatio = 0.35) {
+    const value = String(text || '');
+    if (value.length <= maxChars) return value;
+    if (maxChars <= 0) return '';
+    if (maxChars <= PROMPT_COMPACTION_MARKER.length) return value.substring(value.length - maxChars);
+    const payloadChars = maxChars - PROMPT_COMPACTION_MARKER.length;
+    const headChars = Math.max(0, Math.min(payloadChars, Math.floor(payloadChars * headRatio)));
+    const tailChars = payloadChars - headChars;
+    return value.substring(0, headChars) + PROMPT_COMPACTION_MARKER + value.substring(value.length - tailChars);
+}
+
+function hasExplicitConversationHistory(messages) {
+    const turns = (messages || []).filter(msg => msg && msg.role !== 'system');
+    return turns.length > 1 || turns.some(msg => msg.role === 'assistant' || msg.role === 'tool');
+}
+
+function buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, maxChars = MAX_UPSTREAM_PROMPT_CHARS) {
+    const system = String(systemPrompt || '').trim();
+    const history = String(historyPrefix || '');
+    const conversation = String(conversationPrompt || '').trim();
+    const original = system ? `${system}\n\n${history}${conversation}` : `${history}${conversation}`;
+    const safeMax = Math.max(1, Math.floor(Number(maxChars) || MAX_UPSTREAM_PROMPT_CHARS));
+    if (original.length <= safeMax) {
+        return { prompt: original, compacted: false, historyDropped: false, originalChars: original.length, promptChars: original.length };
+    }
+
+    // Server-side history is only a recovery hint. Drop it before truncating
+    // client-provided messages, which may already contain the same turns.
+    const historyDropped = history.length > 0;
+    const currentConversation = conversation;
+    const separatorLength = system && currentConversation ? 2 : 0;
+    let systemBudget = system ? Math.floor((safeMax - separatorLength) * 0.5) : 0;
+    let conversationBudget = Math.max(0, safeMax - separatorLength - systemBudget);
+
+    // Give unused capacity from a short side to the other side.
+    if (system.length < systemBudget) {
+        systemBudget = system.length;
+        conversationBudget = Math.max(0, safeMax - separatorLength - systemBudget);
+    } else if (currentConversation.length < conversationBudget) {
+        conversationBudget = currentConversation.length;
+        systemBudget = Math.max(0, safeMax - separatorLength - conversationBudget);
+    }
+
+    // Preserve the start of the task/system instructions and the most recent
+    // tool loop. The injected tool adapter lives at the end of systemPrompt.
+    const boundedSystem = truncatePromptMiddle(system, systemBudget, 0.35);
+    const boundedConversation = truncatePromptMiddle(currentConversation, conversationBudget, 0.25);
+    let bounded = boundedSystem && boundedConversation
+        ? `${boundedSystem}\n\n${boundedConversation}`
+        : (boundedSystem || boundedConversation);
+    if (bounded.length > safeMax) bounded = bounded.substring(0, safeMax);
+    return {
+        prompt: bounded,
+        compacted: true,
+        historyDropped,
+        originalChars: original.length,
+        promptChars: bounded.length,
+    };
+}
+
+function appendPromptInstruction(promptText, instruction, maxChars = MAX_UPSTREAM_PROMPT_CHARS) {
+    const suffix = `\n\n${String(instruction || '').trim()}`;
+    const baseBudget = Math.max(0, maxChars - suffix.length);
+    return truncatePromptMiddle(promptText, baseBudget, 0.35) + suffix;
+}
+
+function isContextTooLongError(error) {
+    const message = typeof error === 'string'
+        ? error
+        : `${error?.content || ''} ${error?.message || ''} ${error?.finish_reason || ''} ${error?.type || ''}`;
+    return /(?:content|prompt|context).{0,40}(?:too\s+long|too\s+large|length|limit|maximum)|maximum.{0,30}(?:context|token)|too\s+many\s+tokens|содержани[ея]\s+слишком\s+длин|контекст.{0,30}(?:длин|лимит)|内容.{0,12}(?:过长|太长)|上下文.{0,12}(?:过长|超出)/i.test(message);
+}
+
 function formatMessages(messages, tools) {
     let systemPrompt = '';
     for (const msg of messages) {
         if (msg.role === 'system' && msg.content) {
-            systemPrompt += msg.content + '\n';
+            systemPrompt += normalizeMessageContent(msg.content) + '\n';
         }
     }
     systemPrompt += formatToolDefinitions(tools);
@@ -1129,7 +1333,7 @@ function formatMessages(messages, tools) {
     for (const msg of messages) {
         if (msg.role === 'system') continue;  // already in systemPrompt
         if (msg.role === 'user' && msg.content) {
-            conversation += `User: ${msg.content}\n\n`;
+            conversation += `User: ${normalizeMessageContent(msg.content)}\n\n`;
         } else if (msg.role === 'assistant') {
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 // This was a tool call response from a previous turn
@@ -1137,13 +1341,14 @@ function formatMessages(messages, tools) {
                     conversation += `Assistant: TOOL_CALL: ${tc.function.name}\narguments: ${tc.function.arguments}\n\n`;
                 }
             } else if (msg.content) {
-                conversation += `Assistant: ${msg.content}\n\n`;
+                conversation += `Assistant: ${normalizeMessageContent(msg.content)}\n\n`;
             }
         } else if (msg.role === 'tool' && msg.content) {
             // Tool execution result — send back to DeepSeek as context
-            const truncated = msg.content.length > 8000
-                ? msg.content.substring(0, 8000) + '\n...[truncated]'
-                : msg.content;
+            const toolContent = normalizeMessageContent(msg.content);
+            const truncated = toolContent.length > 8000
+                ? truncatePromptMiddle(toolContent, 8000, 0.35)
+                : toolContent;
             conversation += `[Tool Result]\n${truncated}\n\n`;
         }
     }
@@ -1344,7 +1549,7 @@ const server = http.createServer(async (req, res) => {
 
             // Build history prefix if starting fresh
             let historyPrefix = '';
-            if (!session.id && session.history.length > 0) {
+            if (!session.id && session.history.length > 0 && !hasExplicitConversationHistory(messages)) {
                 historyPrefix = '[Previous conversation]\n';
                 for (const exchange of session.history) {
                     historyPrefix += `User: ${exchange.user}\nAssistant: ${exchange.assistant}\n\n`;
@@ -1352,9 +1557,12 @@ const server = http.createServer(async (req, res) => {
                 historyPrefix += '[Continue from here]\n\n';
             }
 
-            const fullPrompt = systemPrompt
-                ? `${systemPrompt}\n\n${historyPrefix}${prompt}`
-                : `${historyPrefix}${prompt}`;
+            const promptBuild = buildBoundedPrompt(systemPrompt, historyPrefix, prompt);
+            let fullPrompt = promptBuild.prompt;
+            if (promptBuild.compacted) {
+                res.setHeader('X-FreeDeepseek-Context-Compacted', 'true');
+                console.log(`${agentTag} Compacted upstream prompt ${promptBuild.originalChars} -> ${promptBuild.promptChars} chars${promptBuild.historyDropped ? ' (recovery history dropped)' : ''}`);
+            }
 
             const startTime = Date.now();
             const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
@@ -1459,52 +1667,75 @@ const server = http.createServer(async (req, res) => {
             const elapsed = Date.now() - startTime;
             console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
 
-            if ((!fullContent || fullContent.trim().length === 0) && modelError) {
-                res.writeHead(502, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: { message: modelError.content || 'DeepSeek returned an error without content', type: modelError.finish_reason || modelError.type || 'deepseek_model_error', model: requestedModel, real_model: resolveModelConfig(requestedModel).real_model } }));
-                return;
-            }
-
-            // Empty response — retry loop with fresh sessions
+            // Empty/context-overflow recovery. Each retry gets a smaller prompt
+            // and a fresh remote session; bounded attempts prevent retry storms.
             let retryAttempt = 0;
             while (!fullContent || fullContent.trim().length === 0) {
                 // Stop early if the client hung up or we've blown the request budget —
                 // no point burning more PoW solves + account quota for a dead socket.
                 if (clientGone) { console.log(`${agentTag} client disconnected; abandoning empty-retry loop`); return; }
                 if (deadlineHit()) { console.log(`${agentTag} request deadline hit; stopping empty-retry loop`); break; }
+                const contextTooLong = isContextTooLongError(modelError);
+                if (modelError && !contextTooLong) break;
+                if (retryAttempt >= MAX_EMPTY_RETRIES) break;
                 retryAttempt++;
-                if (retryAttempt > MAX_EMPTY_RETRIES) {
-                    console.log(`${agentTag} Empty after ${MAX_EMPTY_RETRIES} retries. Giving up.`);
-                    res.writeHead(502, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({
-                        error: {
-                            message: `DeepSeek returned empty content after ${MAX_EMPTY_RETRIES} retries`,
-                            type: 'empty_response',
-                            agent: agentId,
-                            session_id: session.id,
-                            message_count: session.messageCount,
-                            history_length: session.history.length,
-                            retry_attempts: retryAttempt - 1,
-                        }
-                    }));
-                    return;
-                }
-                console.log(`${agentTag} Empty response (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}). Resetting session...`);
+
+                const retryRatio = contextTooLong
+                    ? Math.max(0.35, 0.8 - retryAttempt * 0.2)
+                    : Math.max(0.5, 1 - retryAttempt * 0.2);
+                const retryBudget = Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(MAX_UPSTREAM_PROMPT_CHARS * retryRatio));
+                const retryBuild = buildBoundedPrompt(systemPrompt, '', prompt, retryBudget);
+                const retryPrompt = retryBuild.prompt.length < fullPrompt.length ? retryBuild.prompt : fullPrompt;
+                const reason = contextTooLong ? 'context-too-long response' : 'empty response';
+                console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Resetting session...`);
                 session.id = null;
                 session.parentMessageId = null;
                 session.createdAt = null;
                 session.messageCount = 0;
                 // Brief delay before retry to let DeepSeek breathe
-                await new Promise(r => setTimeout(r, Math.min(1000 * retryAttempt, 5000)));
-                const { resp: retryResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
+                await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
+                const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryContent = retryResult && retryResult.content ? sanitizeContent(retryResult.content) : '';
                 const retryReasoning = retryResult && retryResult.reasoningContent ? sanitizeContent(retryResult.reasoningContent) : '';
+                fullPrompt = retryPrompt;
+                modelError = retryResult?.modelError || null;
+                finishReason = retryResult?.finishReason || finishReason;
                 if (retryContent && retryContent.trim().length > 0) {
                     console.log(`${agentTag} Retry ${retryAttempt} succeeded`);
                     fullContent = retryContent;
                     reasoningContent = retryReasoning;
                 }
+            }
+
+            if (!fullContent || fullContent.trim().length === 0) {
+                const contextTooLong = isContextTooLongError(modelError);
+                const timedOut = deadlineHit();
+                const errorType = contextTooLong
+                    ? 'context_length_exceeded'
+                    : (timedOut ? 'request_timeout' : (modelError?.type || 'empty_response'));
+                const errorMessage = modelError?.content
+                    || (timedOut
+                        ? 'DeepSeek request deadline reached while recovering an empty response'
+                        : `DeepSeek returned empty content after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}`);
+                console.log(`${agentTag} ${errorType} after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}. Giving up.`);
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    error: {
+                        message: errorMessage,
+                        type: errorType,
+                        agent: agentId,
+                        session_id: session.id,
+                        message_count: session.messageCount,
+                        history_length: session.history.length,
+                        retry_attempts: retryAttempt,
+                        upstream_prompt_chars: fullPrompt.length,
+                        prompt_compacted: promptBuild.compacted || fullPrompt.length < promptBuild.promptChars,
+                        model: requestedModel,
+                        real_model: resolveModelConfig(requestedModel).real_model,
+                    }
+                }));
+                return;
             }
 
             // Auto-continuation: if finish_reason is 'length' or content is very long (>25000 chars),
@@ -1538,32 +1769,54 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            let toolCall = parseToolCall(fullContent);
+            const allowedToolNames = new Set(tools
+                .filter(tool => tool?.type === 'function' && tool.function?.name)
+                .map(tool => tool.function.name));
+            let toolCall = allowedToolNames.size > 0 ? parseToolCall(fullContent) : null;
+            if (toolCall && !allowedToolNames.has(toolCall.name)) {
+                console.log(`${agentTag} Model requested unknown tool ${toolCall.name}; attempting format repair.`);
+                toolCall = null;
+            }
             
-            // Retry if TOOL_CALL was found but JSON was truncated/invalid
-            if (!toolCall && /TOOL_CALL:\s*\w/i.test(fullContent)) {
-                console.log(`${agentTag} TOOL_CALL detected but JSON invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
+            // Retry once if legacy, XML, or DSML tool markup was truncated or
+            // malformed. Never pass raw DSML through as a normal assistant turn.
+            if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
+                console.log(`${agentTag} Tool-call markup detected but invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
                 session.id = null;
                 session.parentMessageId = null;
                 session.createdAt = null;
                 session.messageCount = 0;
                 await new Promise(r => setTimeout(r, 1000));
-                const strictPrompt = fullPrompt + '\n\n[STRICT INSTRUCTION] Your previous response had a TOOL_CALL but the arguments were too long and got cut off. Keep the arguments SHORT — no large file contents. Just use a minimal example or reference the file by name. Output ONLY: TOOL_CALL: <function>\narguments: <short JSON>';
+                const strictPrompt = appendPromptInstruction(
+                    fullPrompt,
+                    '[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}'
+                );
                 const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
                 const retryResult2 = await readDeepSeekResponse(retryResp2.body);
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
                     const retryTc = parseToolCall(retryContent2);
-                    if (retryTc) {
+                    if (retryTc && allowedToolNames.has(retryTc.name)) {
                         console.log(`${agentTag} Retry with strict prompt succeeded: ${retryTc.name}`);
                         fullContent = retryContent2;
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
                         toolCall = retryTc;
                     } else {
-                        console.log(`${agentTag} Retry still has broken JSON. Sending as text.`);
+                        console.log(`${agentTag} Retry still has broken tool markup. Returning a safe error instead of leaking it as text.`);
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
                     }
                 }
+            }
+
+            if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent)) {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: {
+                    message: 'DeepSeek returned malformed tool-call markup after one repair attempt',
+                    type: 'malformed_tool_call',
+                    model: requestedModel,
+                    real_model: resolveModelConfig(requestedModel).real_model,
+                } }));
+                return;
             }
             
             // Check if any tool results in the current conversation contained a screenshot path.
@@ -1722,6 +1975,15 @@ module.exports = {
         isDeepSeekModelErrorEvent,
         rebuildFragmentText,
         applyResponsePatchOperations,
+        compactToolSchema,
+        formatToolDefinitions,
+        parseToolCall,
+        parseDsmlToolCall,
+        looksLikeToolCallMarkup,
+        truncatePromptMiddle,
+        hasExplicitConversationHistory,
+        buildBoundedPrompt,
+        isContextTooLongError,
         createSession,
         sweepIdleSessions,
         sessions,

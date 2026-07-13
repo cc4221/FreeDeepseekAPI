@@ -167,3 +167,103 @@ test('loopback host detection covers supported local bind addresses', () => {
   assert.equal(serverInternals.isLoopbackHost('localhost'), true);
   assert.equal(serverInternals.isLoopbackHost('0.0.0.0'), false);
 });
+
+test('parseToolCall converts canonical DeepSeek DSML into an OpenAI tool call', () => {
+  const dsml = [
+    'I will inspect it.',
+    '<｜DSML｜tool_calls>',
+    '<｜DSML｜invoke name="execute_code">',
+    '<｜DSML｜parameter name="code" string="true">print("ok")</｜DSML｜parameter>',
+    '<｜DSML｜parameter name="timeout" string="false">30</｜DSML｜parameter>',
+    '<｜DSML｜parameter name="capture" string="false">true</｜DSML｜parameter>',
+    '</｜DSML｜invoke>',
+    '</｜DSML｜tool_calls>',
+  ].join('\n');
+
+  const call = serverInternals.parseToolCall(dsml);
+  assert.equal(call.name, 'execute_code');
+  assert.deepEqual(JSON.parse(call.arguments), {
+    code: 'print("ok")',
+    timeout: 30,
+    capture: true,
+  });
+});
+
+test('parseToolCall accepts the doubled-bar DSML Web variant from issue #19', () => {
+  const dsml = [
+    '<｜｜DSML｜｜ Tool Calls>',
+    '<｜｜DSML｜｜ name="web_search">{"query":"DeepSeek DSML"}',
+    '</｜｜DSML｜｜ Tool Calls>',
+  ].join('\n');
+
+  const call = serverInternals.parseToolCall(dsml);
+  assert.equal(call.name, 'web_search');
+  assert.deepEqual(JSON.parse(call.arguments), { query: 'DeepSeek DSML' });
+});
+
+test('parseToolCall refuses incomplete DSML instead of executing JSON found inside it', () => {
+  const malformed = [
+    '<｜DSML｜tool_calls>',
+    '<｜DSML｜invoke name="execute_code">',
+    '{"name":"dangerous_fallback","code":"rm -rf /"}',
+    '</｜DSML｜tool_calls>',
+  ].join('\n');
+
+  assert.equal(serverInternals.parseToolCall(malformed), null);
+  assert.equal(serverInternals.looksLikeToolCallMarkup(malformed), true);
+});
+
+test('tool schema compaction drops prose annotations but preserves validation shape', () => {
+  const compact = serverInternals.compactToolSchema({
+    type: 'object',
+    description: 'large top-level description',
+    properties: {
+      command: { type: 'string', description: 'large property description' },
+      count: { type: 'integer', minimum: 1 },
+    },
+    required: ['command'],
+  });
+
+  assert.deepEqual(compact, {
+    type: 'object',
+    properties: {
+      command: { type: 'string' },
+      count: { type: 'integer', minimum: 1 },
+    },
+    required: ['command'],
+  });
+});
+
+test('buildBoundedPrompt preserves task edges and drops duplicate recovery history', () => {
+  const system = `SYSTEM_START\n${'s'.repeat(50000)}\nTOOL_ADAPTER_END`;
+  const history = `[Previous conversation]\n${'h'.repeat(10000)}\n`;
+  const conversation = `TASK_START\n${'c'.repeat(70000)}\nLATEST_TOOL_RESULT`;
+  const bounded = serverInternals.buildBoundedPrompt(system, history, conversation, 20000);
+
+  assert.equal(bounded.compacted, true);
+  assert.equal(bounded.historyDropped, true);
+  assert.ok(bounded.prompt.length <= 20000);
+  assert.match(bounded.prompt, /SYSTEM_START/);
+  assert.match(bounded.prompt, /TOOL_ADAPTER_END/);
+  assert.match(bounded.prompt, /TASK_START/);
+  assert.match(bounded.prompt, /LATEST_TOOL_RESULT/);
+  assert.doesNotMatch(bounded.prompt, /Previous conversation/);
+});
+
+test('client-provided multi-turn history suppresses server recovery-history injection', () => {
+  assert.equal(serverInternals.hasExplicitConversationHistory([
+    { role: 'system', content: 'rules' },
+    { role: 'user', content: 'hello' },
+  ]), false);
+  assert.equal(serverInternals.hasExplicitConversationHistory([
+    { role: 'user', content: 'hello' },
+    { role: 'assistant', content: 'hi' },
+    { role: 'tool', content: 'result' },
+  ]), true);
+});
+
+test('context-too-long detector recognizes DeepSeek localized errors', () => {
+  assert.equal(serverInternals.isContextTooLongError({ content: 'Содержание слишком длинное. Сократите его и попробуйте снова.' }), true);
+  assert.equal(serverInternals.isContextTooLongError({ content: 'Maximum context length exceeded' }), true);
+  assert.equal(serverInternals.isContextTooLongError({ content: 'Temporary backend overload' }), false);
+});

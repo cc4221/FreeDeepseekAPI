@@ -241,6 +241,9 @@ FreeDeepseekAPI не создаёт новый DeepSeek чат на каждый
 - если session id уже есть — proxy переиспользует его и продолжает chain через `parent_message_id`;
 - auto-reset происходит при TTL, ошибке DeepSeek session или слишком длинной цепочке сообщений;
 - локальная history сохраняется коротким контекстом, чтобы новая DeepSeek session могла продолжить разговор.
+- длинные agent-запросы перед отправкой ограничиваются `DEEPSEEK_MAX_PROMPT_CHARS` (по умолчанию 80 000 символов): сохраняются начало задачи, свежие tool results и tool adapter;
+- если клиент уже прислал multi-turn history, локальная recovery-history второй раз не добавляется;
+- пустой ответ повторяется максимум `DEEPSEEK_MAX_RETRIES` раз (по умолчанию 2), причём на каждом retry контекст уменьшается.
 
 Явно задать agent/session:
 
@@ -442,6 +445,7 @@ FreeDeepseekAPI принимает:
 - `TOOL_CALL:`
 - fenced JSON
 - `<tool_call>...</tool_call>`
+- DeepSeek DSML (`<｜DSML｜tool_calls>...`) и Web-вариант с `<｜｜DSML｜｜ Tool Calls>`
 
 ---
 
