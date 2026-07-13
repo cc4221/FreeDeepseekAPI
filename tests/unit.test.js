@@ -271,9 +271,9 @@ test('parseToolCall accepts zero-argument, CDATA, legacy, collapsed, and prefixe
   assert.deepEqual(zeroArg, { name: 'ping', arguments: '{}' });
 
   const cdata = serverInternals.parseToolCall(
-    '<tool_calls><invoke name="write_file"><parameter name="content"><![CDATA[line 1\n<line 2>]]></parameter></invoke></tool_calls>'
+    '<tool_calls><invoke name="write_file"><parameter name="content"><![CDATA[line 1\n<line 2>\n</parameter>\n</invoke>\n</tool_calls>]]></parameter></invoke></tool_calls>'
   );
-  assert.deepEqual(JSON.parse(cdata.arguments), { content: 'line 1\n<line 2>' });
+  assert.deepEqual(JSON.parse(cdata.arguments), { content: 'line 1\n<line 2>\n</parameter>\n</invoke>\n</tool_calls>' });
 
   const collapsed = serverInternals.parseToolCall(
     '<DSMLtool_calls><DSMLinvoke name="read_file"><DSMLparameter name="path">/tmp/a</DSMLparameter></DSMLinvoke></DSMLtool_calls>'
@@ -338,6 +338,11 @@ test('parseToolCall bounds tool markup and scans unmatched braces in linear time
   const started = Date.now();
   assert.equal(serverInternals.parseToolCall('{'.repeat(64 * 1024)), null);
   assert.ok(Date.now() - started < 1000, 'unmatched JSON braces should not block the event loop');
+
+  const malformedTagStarted = Date.now();
+  const malformedTags = `<tool_calls><invoke name="${'<invoke name="'.repeat(16000)}</tool_calls>`;
+  assert.equal(serverInternals.parseToolCall(malformedTags), null);
+  assert.ok(Date.now() - malformedTagStarted < 1000, 'malformed quoted DSML tags should be rejected in bounded time');
 });
 
 test('parseToolCall refuses incomplete DSML instead of executing JSON found inside it', () => {
@@ -350,6 +355,31 @@ test('parseToolCall refuses incomplete DSML instead of executing JSON found insi
 
   assert.equal(serverInternals.parseToolCall(malformed), null);
   assert.equal(serverInternals.looksLikeToolCallMarkup(malformed), true);
+});
+
+test('parseToolCall rejects partially consumed DSML parameters and wrapper scope', () => {
+  const truncatedSecondParameter = '<tool_calls><invoke name="write_file"><parameter name="path">/tmp/a</parameter><parameter name="content">truncated</invoke></tool_calls>';
+  const trailingInvokeJunk = '<tool_calls><invoke name="write_file"><parameter name="path">/tmp/a</parameter>GARBAGE</invoke></tool_calls>';
+  const truncatedSecondInvoke = '<tool_calls><invoke name="ping"></invoke><invoke name="write_file"><parameter name="path">/tmp/a</tool_calls>';
+  const twoCompleteInvokes = '<tool_calls><invoke name="ping"></invoke><invoke name="ping"></invoke></tool_calls>';
+  const secondInvokeOutsideWrapper = '<tool_calls><invoke name="ping"></invoke></tool_calls><invoke name="write_file"><parameter name="path">/tmp/a</parameter></invoke>';
+  const trailingWrapperJunk = '<tool_calls><invoke name="ping"></invoke>GARBAGE</tool_calls>';
+  const unclosedCdata = '<tool_calls><invoke name="write_file"><parameter name="content"><![CDATA[truncated</parameter></invoke></tool_calls>';
+  const tooManyParameters = `<tool_calls><invoke name="write_file">${Array.from({ length: 129 }, (_, i) => `<parameter name="p${i}">${i}</parameter>`).join('')}</invoke></tool_calls>`;
+
+  for (const malformed of [
+    truncatedSecondParameter,
+    trailingInvokeJunk,
+    truncatedSecondInvoke,
+    twoCompleteInvokes,
+    secondInvokeOutsideWrapper,
+    trailingWrapperJunk,
+    unclosedCdata,
+    tooManyParameters,
+  ]) {
+    assert.equal(serverInternals.parseToolCall(malformed), null, malformed);
+    assert.equal(serverInternals.looksLikeToolCallMarkup(malformed), true, malformed);
+  }
 });
 
 test('tool schema compaction drops prose annotations but preserves validation shape', () => {

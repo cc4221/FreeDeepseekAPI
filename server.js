@@ -722,6 +722,8 @@ const MAX_TOOL_MARKUP_CHARS = 256 * 1024;
 const MAX_TOOL_ARGUMENT_CHARS = 128 * 1024;
 const MAX_TOOL_JSON_CANDIDATES = 32;
 const MAX_DSML_PARAMETERS = 128;
+const MAX_DSML_STRUCTURAL_TAGS = MAX_DSML_PARAMETERS * 2 + 16;
+const MAX_DSML_TAG_CHARS = 2048;
 
 function extractBalancedJsonAt(text, startIndex) {
     if (text[startIndex] !== '{') return null;
@@ -889,30 +891,119 @@ function getMarkupAttribute(attrs, attribute) {
     return match ? match[2] : null;
 }
 
+function readDsmlTagAt(text, start) {
+    if (text[start] !== '<') return null;
+    const prefix = text.substring(start + 1, Math.min(text.length, start + 40)).trimStart();
+    if (!/^\/?(?:tool_calls|invoke|parameter|direct)\b/i.test(prefix)) return null;
+    let quote = null;
+    let end = -1;
+    const scanEnd = Math.min(text.length, start + MAX_DSML_TAG_CHARS + 1);
+    for (let i = start + 1; i < scanEnd; i++) {
+        const ch = text[i];
+        if (quote) {
+            if (ch === quote) quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'") {
+            quote = ch;
+            continue;
+        }
+        if (ch === '>') {
+            end = i;
+            break;
+        }
+    }
+    if (end === -1) return { invalid: true };
+
+    let token = text.substring(start + 1, end).trim();
+    let closing = false;
+    if (token.startsWith('/')) {
+        closing = true;
+        token = token.substring(1).trim();
+    }
+    let selfClosing = false;
+    if (!closing && token.endsWith('/')) {
+        selfClosing = true;
+        token = token.substring(0, token.length - 1).trim();
+    }
+    const match = token.match(/^(tool_calls|invoke|parameter|direct)\b([\s\S]*)$/i);
+    if (!match) return null;
+    return {
+        name: match[1].toLowerCase(),
+        attrs: closing ? '' : match[2],
+        closing,
+        selfClosing,
+        start,
+        end: end + 1,
+    };
+}
+
+function scanDsmlStructuralTags(text) {
+    const tags = [];
+    const value = String(text || '');
+    for (let i = 0; i < value.length;) {
+        if (value.substring(i, i + 9).toUpperCase() === '<![CDATA[') {
+            const cdataEnd = value.indexOf(']]>', i + 9);
+            if (cdataEnd === -1) return null;
+            i = cdataEnd + 3;
+            continue;
+        }
+        if (value[i] !== '<') {
+            i++;
+            continue;
+        }
+        const tag = readDsmlTagAt(value, i);
+        if (!tag) {
+            i++;
+            continue;
+        }
+        if (tag.invalid) return null;
+        tags.push(tag);
+        if (tags.length > MAX_DSML_STRUCTURAL_TAGS) return null;
+        i = tag.end;
+    }
+    return tags;
+}
+
+function parseDsmlParameter(attrs, rawBody, args, seenNames) {
+    const parameterName = getMarkupAttribute(attrs, 'name');
+    if (!parameterName || !/^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/.test(parameterName) || seenNames.has(parameterName)) return false;
+    seenNames.add(parameterName);
+    const stringMode = getMarkupAttribute(attrs, 'string');
+    const rawValue = decodeDsmlParameterValue(rawBody);
+    if (rawValue.length > MAX_TOOL_ARGUMENT_CHARS) return false;
+    let value = rawValue;
+    if (stringMode && stringMode.toLowerCase() === 'false') {
+        try { value = JSON.parse(rawValue.trim()); } catch (e) { return false; }
+    }
+    args[parameterName] = value;
+    return true;
+}
+
 function parseDsmlInvoke(name, body) {
+    const structuralTags = scanDsmlStructuralTags(body);
+    if (!structuralTags) return null;
+    const parameterTags = structuralTags.filter(tag => tag.name === 'parameter');
+    if (structuralTags.some(tag => tag.name !== 'parameter')) return null;
+
     const args = {};
     let parameterCount = 0;
     const seenNames = new Set();
-    const parameterRe = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/gi;
-    let parameterMatch;
-    while ((parameterMatch = parameterRe.exec(body)) !== null) {
+    let cursor = 0;
+    for (let i = 0; i < parameterTags.length; i += 2) {
+        const opening = parameterTags[i];
+        const closing = parameterTags[i + 1];
+        if (!opening || opening.closing || opening.selfClosing || !closing || !closing.closing) return null;
+        if (body.substring(cursor, opening.start).trim()) return null;
         parameterCount++;
         if (parameterCount > MAX_DSML_PARAMETERS) return null;
-        const attrs = parameterMatch[1] || '';
-        const parameterName = getMarkupAttribute(attrs, 'name');
-        if (!parameterName || !/^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/.test(parameterName) || seenNames.has(parameterName)) return null;
-        seenNames.add(parameterName);
-        const stringMode = getMarkupAttribute(attrs, 'string');
-        const rawValue = decodeDsmlParameterValue(parameterMatch[2]);
-        if (rawValue.length > MAX_TOOL_ARGUMENT_CHARS) return null;
-        let value = rawValue;
-        if (stringMode && stringMode.toLowerCase() === 'false') {
-            try { value = JSON.parse(rawValue.trim()); } catch (e) { return null; }
-        }
-        args[parameterName] = value;
+        if (!parseDsmlParameter(opening.attrs, body.substring(opening.end, closing.start), args, seenNames)) return null;
+        cursor = closing.end;
     }
-    if (/<parameter\b/i.test(body) && parameterCount === 0) return null;
-    if (parameterCount > 0) return buildToolCall(name, args);
+    if (parameterCount > 0) {
+        if (body.substring(cursor).trim()) return null;
+        return buildToolCall(name, args);
+    }
 
     const decodedBody = decodeDsmlValue(body).trim();
     if (!decodedBody) return buildToolCall(name, {});
@@ -923,23 +1014,28 @@ function parseDsmlInvoke(name, body) {
 }
 
 function extractToolCallScope(normalized) {
-    const lower = normalized.toLowerCase();
-    const openTag = '<tool_calls>';
-    const closeTag = '</tool_calls>';
-    const openIndex = lower.indexOf(openTag);
-    const closeIndex = lower.indexOf(closeTag, Math.max(0, openIndex + openTag.length));
-    if (openIndex !== -1) {
-        if (closeIndex === -1) return null;
-        if (lower.indexOf(openTag, openIndex + openTag.length) !== -1) return null;
-        if (lower.indexOf(closeTag, closeIndex + closeTag.length) !== -1) return null;
-        return normalized.substring(openIndex + openTag.length, closeIndex);
+    const tags = scanDsmlStructuralTags(normalized);
+    if (!tags) return null;
+    const wrappers = tags.filter(tag => tag.name === 'tool_calls');
+    const openings = wrappers.filter(tag => !tag.closing);
+    const closings = wrappers.filter(tag => tag.closing);
+    if (openings.length > 0) {
+        if (openings.length !== 1 || openings[0].selfClosing || closings.length === 0) return null;
+        const opening = openings[0];
+        const closing = closings[closings.length - 1];
+        if (wrappers.some(tag => tag.closing && tag.start < opening.end) || closing.start < opening.end) return null;
+        if (tags.some(tag => tag.name !== 'tool_calls' && (tag.start < opening.end || tag.start >= closing.start))) return null;
+        return normalized.substring(opening.end, closing.start);
     }
     // Narrow repair: tolerate a missing opening wrapper only when a closing
     // wrapper exists. A bare invoke without this sentinel is never executable.
-    if (closeIndex !== -1) {
-        const beforeClose = normalized.substring(0, closeIndex);
-        const invokeIndex = beforeClose.toLowerCase().lastIndexOf('<invoke');
-        if (invokeIndex !== -1) return beforeClose.substring(invokeIndex);
+    if (closings.length > 0) {
+        const closing = closings[closings.length - 1];
+        const invokeOpenings = tags.filter(tag => tag.name === 'invoke' && !tag.closing && tag.start < closing.start);
+        if (invokeOpenings.length === 1 && !invokeOpenings[0].selfClosing) {
+            if (tags.some(tag => tag.name !== 'tool_calls' && (tag.start < invokeOpenings[0].start || tag.start >= closing.start))) return null;
+            return normalized.substring(invokeOpenings[0].start, closing.start);
+        }
     }
     return null;
 }
@@ -949,25 +1045,27 @@ function parseDsmlToolCall(text) {
     const normalized = normalizeToolMarkupTags(text);
     const scope = extractToolCallScope(normalized);
     if (scope === null) return null;
-    const calls = [];
-    const invokeRe = /<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/gi;
-    let invokeMatch;
-    while ((invokeMatch = invokeRe.exec(scope)) !== null) {
-        const name = getMarkupAttribute(invokeMatch[1], 'name');
-        const parsed = parseDsmlInvoke(name, invokeMatch[2]);
-        if (!parsed) return null;
-        calls.push(parsed);
-        if (calls.length > 1) return null;
-    }
-    if (calls.length === 1) {
-        console.log(`[parseToolCall] SUCCESS dsml: ${calls[0].name} (args=${calls[0].arguments.length} chars)`);
-        return calls[0];
-    }
-    if (/<invoke\b/i.test(scope)) return null;
+    const tags = scanDsmlStructuralTags(scope);
+    if (!tags || tags.length === 0) return null;
+    const first = tags[0];
+    if (scope.substring(0, first.start).trim()) return null;
 
-    const directMatch = scope.match(/^\s*<direct\b([^>]*)>([\s\S]*?)\s*$/i);
-    if (directMatch) {
-        const parsed = parseDsmlInvoke(getMarkupAttribute(directMatch[1], 'name'), directMatch[2]);
+    if (first.name === 'invoke' && !first.closing && !first.selfClosing) {
+        const invokeTags = tags.filter(tag => tag.name === 'invoke');
+        if (invokeTags.length !== 2 || invokeTags[0] !== first || invokeTags[1].closing !== true) return null;
+        const closing = invokeTags[1];
+        if (scope.substring(closing.end).trim()) return null;
+        if (tags.some(tag => (tag.name === 'tool_calls' || tag.name === 'direct'))) return null;
+        const parsed = parseDsmlInvoke(getMarkupAttribute(first.attrs, 'name'), scope.substring(first.end, closing.start));
+        if (parsed) {
+            console.log(`[parseToolCall] SUCCESS dsml: ${parsed.name} (args=${parsed.arguments.length} chars)`);
+            return parsed;
+        }
+    }
+
+    if (first.name === 'direct' && !first.closing && !first.selfClosing) {
+        if (tags.some((tag, index) => index > 0 && (tag.name === 'direct' || tag.name === 'invoke' || tag.name === 'tool_calls'))) return null;
+        const parsed = parseDsmlInvoke(getMarkupAttribute(first.attrs, 'name'), scope.substring(first.end));
         if (parsed) {
             console.log(`[parseToolCall] SUCCESS dsml-direct: ${parsed.name} (args=${parsed.arguments.length} chars)`);
             return parsed;
