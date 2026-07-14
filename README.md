@@ -38,6 +38,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - [Windows запуск](#-windows-запуск)
 - [Linux / Chromium запуск](#-linux--chromium-запуск)
 - [VPS / headless запуск](#-vps--headless-запуск)
+- [Rootless Podman](#-rootless-podman)
 - [Diagnostics / doctor](#-diagnostics--doctor)
 - [Session reuse и сброс чатов](#-session-reuse-и-сброс-чатов)
 - [Multi-account pool](#-multi-account-pool)
@@ -121,6 +122,21 @@ SKIP_ACCOUNT_MENU=1 npm start
 http://localhost:9655
 ```
 
+По умолчанию proxy доступен только с этого компьютера. Для доступа из сети
+явно задайте адрес и отдельный ключ proxy:
+
+```bash
+HOST=0.0.0.0 PROXY_API_KEY='replace-with-a-long-random-value' npm start
+```
+
+После этого передавайте ключ как `Authorization: Bearer <key>`. Без
+`PROXY_API_KEY` non-health endpoints остаются без авторизации, поэтому не
+публикуйте такой экземпляр в сеть.
+
+Browser-запросы разрешены с loopback-origin. Если UI открыт на другом адресе,
+добавьте его точный origin через запятую, например
+`PROXY_CORS_ORIGINS=https://ui.example.com,http://192.168.1.20:3000`.
+
 ---
 
 ## 🪟 Windows запуск
@@ -202,6 +218,89 @@ DEEPSEEK_TOKEN="<token>" npm run auth:import -- --input ./cookies.json
 
 ---
 
+## 🦭 Rootless Podman
+
+Контейнер предназначен только для non-interactive запуска proxy. Авторизацию
+через браузер выполните на хосте командой `npm run auth`: auth-скрипты и
+`deepseek-auth.json` в образ не копируются.
+
+Запускайте Podman обычным пользователем, без `sudo`.
+
+1. Соберите локальный образ:
+
+```bash
+podman build --tag localhost/free-deepseek-api:local --file Containerfile .
+```
+
+2. Передайте DeepSeek auth и отдельный ключ proxy через Podman secrets:
+
+```bash
+podman secret create --replace free-deepseek-auth ./deepseek-auth.json
+
+printf 'Proxy API key: '
+IFS= read -r -s PROXY_API_KEY
+printf '\n'
+printf '%s' "$PROXY_API_KEY" |
+  podman secret create --replace free-deepseek-proxy-key -
+```
+
+Используйте длинный случайный ключ. Значение останется в переменной
+`PROXY_API_KEY` текущего shell, чтобы проверить API; оно не попадает в образ или
+командную строку Podman.
+
+3. Запустите контейнер с минимальными привилегиями:
+
+```bash
+podman run --detach \
+  --name free-deepseek-api \
+  --publish 127.0.0.1:9655:9655 \
+  --secret free-deepseek-auth,target=deepseek-auth.json,uid=1000,gid=1000,mode=0400 \
+  --secret free-deepseek-proxy-key,target=proxy-api-key,uid=1000,gid=1000,mode=0400 \
+  --read-only \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  localhost/free-deepseek-api:local
+```
+
+Внутри контейнера заранее выставлены `NON_INTERACTIVE=1`, `HOST=0.0.0.0` и
+пути к обоим secrets. `REQUIRE_PROXY_API_KEY=1` не даст контейнеру запуститься,
+если secret с ключом отсутствует или пуст. На хосте порт публикуется только на
+`127.0.0.1`; не убирайте этот адрес без отдельного сетевого firewall/access
+policy.
+
+4. Проверьте liveness, readiness аккаунта и защищённый endpoint:
+
+```bash
+podman healthcheck run free-deepseek-api
+curl --fail http://127.0.0.1:9655/readyz
+curl --fail \
+  -H "Authorization: Bearer $PROXY_API_KEY" \
+  http://127.0.0.1:9655/v1/models
+```
+
+Встроенный healthcheck проверяет локальный `/health` (жив ли процесс).
+`/readyz` дополнительно вернёт `503`, если ни один DeepSeek auth-аккаунт сейчас
+не готов обслуживать запросы. Диагностика контейнера:
+
+```bash
+podman logs free-deepseek-api
+podman inspect --format '{{.State.Health.Status}}' free-deepseek-api
+```
+
+Остановка и удаление контейнера вместе с сохранёнными Podman secrets:
+
+```bash
+podman stop free-deepseek-api
+podman rm free-deepseek-api
+podman secret rm free-deepseek-auth free-deepseek-proxy-key
+unset PROXY_API_KEY
+```
+
+При ротации auth или proxy key замените соответствующий secret и пересоздайте
+контейнер, чтобы поведение не зависело от версии Podman.
+
+---
+
 ## 🩺 Diagnostics / doctor
 
 ```bash
@@ -230,6 +329,9 @@ FreeDeepseekAPI не создаёт новый DeepSeek чат на каждый
 - если session id уже есть — proxy переиспользует его и продолжает chain через `parent_message_id`;
 - auto-reset происходит при TTL, ошибке DeepSeek session или слишком длинной цепочке сообщений;
 - локальная history сохраняется коротким контекстом, чтобы новая DeepSeek session могла продолжить разговор.
+- длинные agent-запросы перед отправкой ограничиваются `DEEPSEEK_MAX_PROMPT_CHARS` (по умолчанию 80 000 символов): сохраняются начало задачи, свежие tool results и tool adapter;
+- если клиент уже прислал multi-turn history, локальная recovery-history второй раз не добавляется;
+- пустой ответ повторяется максимум `DEEPSEEK_MAX_RETRIES` раз (по умолчанию 2), причём на каждом retry контекст уменьшается.
 
 Явно задать agent/session:
 
@@ -429,8 +531,9 @@ FreeDeepseekAPI принимает:
 Прокси просит DeepSeek вернуть строгий JSON tool call, но также умеет парсить fallback-форматы:
 
 - `TOOL_CALL:`
-- fenced JSON
+- fenced JSON with an explicit `tool_call`, `tool_calls`, or `function_call` envelope
 - `<tool_call>...</tool_call>`
+- DeepSeek DSML (`<｜DSML｜tool_calls>...`) и Web-вариант с `<｜｜DSML｜｜ Tool Calls>`
 
 ---
 
@@ -502,7 +605,9 @@ http://host.docker.internal:9655/v1
 http://localhost:9655/v1
 ```
 
-API key можно указать любой: proxy сам ходит в DeepSeek Web через сохранённую browser-сессию.
+Если `PROXY_API_KEY` не задан, API key можно указать любой. Если ключ задан,
+клиент должен передавать именно его — proxy проверяет bearer token перед
+доступом к моделям, сессиям и completions.
 
 ---
 
