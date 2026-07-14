@@ -1,4 +1,4 @@
-services:
+﻿services:
   deepseek-api:
     build:
       context: .
@@ -11,12 +11,15 @@ services:
       - PORT=${PORT:-9655}
       - HOST=0.0.0.0
       - DEEPSEEK_AUTH_PATH=/app/data/deepseek-auth.json
+      - SESSIONS_CACHE_PATH=/app/sessions-cache.json
       - NON_INTERACTIVE=1
       - SKIP_ACCOUNT_MENU=1
       - DEEPSEEK_ACCOUNT_COOLDOWN_MS=${DEEPSEEK_ACCOUNT_COOLDOWN_MS:-600000}
     volumes:
       # Mount auth file directly from host
       - ./deepseek-auth.json:/app/data/deepseek-auth.json:ro
+      # Persist sessions cache across container restarts
+      - ./sessions-cache.json:/app/sessions-cache.json
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9655/health"]
       interval: 30s

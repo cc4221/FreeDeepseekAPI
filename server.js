@@ -54,6 +54,61 @@ function isTruthy(value) { return typeof value === 'string' && ['1','true','yes'
 
 // === Per-Agent Session Store ===
 const sessions = new Map();  // keyed by agent ID (from `user` field)
+const SESSIONS_CACHE_PATH = process.env.SESSIONS_CACHE_PATH || path.join(__dirname, 'sessions-cache.json');
+
+function saveSessionsToDisk() {
+    try {
+        if (fs.existsSync(SESSIONS_CACHE_PATH) && fs.statSync(SESSIONS_CACHE_PATH).isDirectory()) {
+            console.error(`[DS-API] Skipping sessions cache save: ${SESSIONS_CACHE_PATH} is a directory, not a file.`);
+            return;
+        }
+        const data = {};
+        for (const [agentId, session] of sessions.entries()) {
+            data[agentId] = {
+                id: session.id,
+                parentMessageId: session.parentMessageId,
+                createdAt: session.createdAt,
+                messageCount: session.messageCount,
+                accountId: session.accountId,
+                history: session.history,
+                modelId: session.modelId
+            };
+        }
+        fs.writeFileSync(SESSIONS_CACHE_PATH, JSON.stringify(data, null, 2), 'utf8');
+    } catch (e) {
+        console.error(`[DS-API] Error saving sessions cache: ${e.message}`);
+    }
+}
+
+function loadSessionsFromDisk() {
+    try {
+        if (fs.existsSync(SESSIONS_CACHE_PATH)) {
+            if (fs.statSync(SESSIONS_CACHE_PATH).isDirectory()) {
+                console.error(`[DS-API] Skipping sessions cache load: ${SESSIONS_CACHE_PATH} is a directory, not a file.`);
+                return;
+            }
+            const raw = fs.readFileSync(SESSIONS_CACHE_PATH, 'utf8');
+            const data = JSON.parse(raw);
+            for (const [agentId, s] of Object.entries(data)) {
+                sessions.set(agentId, {
+                    id: s.id || null,
+                    parentMessageId: s.parentMessageId || null,
+                    createdAt: s.createdAt || null,
+                    messageCount: s.messageCount || 0,
+                    accountId: s.accountId || null,
+                    history: s.history || [],
+                    modelId: s.modelId || null
+                });
+            }
+            console.log(`[DS-API] Restored ${sessions.size} agent session(s) from persistent disk cache.`);
+        }
+    } catch (e) {
+        console.error(`[DS-API] Error loading sessions cache: ${e.message}`);
+    }
+}
+
+loadSessionsFromDisk();
+
 const MAX_HISTORY_LENGTH = 15;
 const MAX_HISTORY_CHARS = 10000;
 const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
@@ -1594,6 +1649,8 @@ function storeHistory(agentId, prompt, content, toolCall) {
         const removed = session.history.shift();
         historyChars -= removed.user.length + removed.assistant.length;
     }
+
+    saveSessionsToDisk();
 }
 
 // Extract MEDIA: paths from tool results that contain screenshot paths
@@ -1744,6 +1801,7 @@ const server = http.createServer(async (req, res) => {
         if (agentId === 'all') {
             const count = sessions.size;
             sessions.clear();
+            saveSessionsToDisk();
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'all_sessions_cleared', count }));
             return;
@@ -1760,6 +1818,7 @@ const server = http.createServer(async (req, res) => {
         session.parentMessageId = null;
         session.createdAt = null;
         session.messageCount = 0;
+        saveSessionsToDisk();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'session_reset', agent: agentId, history_preserved: historyCount, history: historyPreview }));
         return;
@@ -1844,11 +1903,18 @@ const server = http.createServer(async (req, res) => {
             const { prompt, systemPrompt } = formatMessages(messages, tools);
 
             let historyPrefix = '';
+            const clientHasHistory = messages.filter(m => m.role === 'user' || m.role === 'assistant').length > 1;
+
             if (!session.id && session.history.length > 0) {
-                for (const exchange of session.history) {
-                    historyPrefix += `User: ${exchange.user}\nAssistant: ${exchange.assistant}\n\n`;
+                if (!clientHasHistory) {
+                    console.log(`${agentTag} Client sent single-turn message. Injecting proxy's cached [Previous conversation] (history size: ${session.history.length})`);
+                    for (const exchange of session.history) {
+                        historyPrefix += `User: ${exchange.user}\nAssistant: ${exchange.assistant}\n\n`;
+                    }
+                    if (historyPrefix) historyPrefix = '[Previous conversation]\n' + historyPrefix + '[Continue from here]\n\n';
+                } else {
+                    console.log(`${agentTag} Client already sent full conversation history (${messages.length} messages). Skipping duplicate [Previous conversation] injection.`);
                 }
-                if (historyPrefix) historyPrefix = '[Previous conversation]\n' + historyPrefix + '[Continue from here]\n\n';
             }
 
             const fullPrompt = systemPrompt
@@ -2130,6 +2196,7 @@ const server = http.createServer(async (req, res) => {
                     sendOpenAIStream(res, openaiResponse);
                 }
                 console.log(`${agentTag} Streamed ${apiMode} (tool=${!!toolCall}) in ${elapsed}ms`);
+                saveSessionsToDisk();
             } else {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 if (apiMode === 'anthropic') {
@@ -2140,6 +2207,7 @@ const server = http.createServer(async (req, res) => {
                     res.end(JSON.stringify(openaiResponse));
                 }
                 console.log(`${agentTag} Response ${apiMode} (tool=${!!toolCall}, ${elapsed}ms, ${fullContent.length} chars)`);
+                saveSessionsToDisk();
             }
         } catch (e) {
             console.log('[DS-API] Error:', e.message);

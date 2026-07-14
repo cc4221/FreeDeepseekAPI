@@ -1,4 +1,4 @@
-FROM node:20-alpine
+﻿FROM node:20-alpine
 
 WORKDIR /app
 
@@ -13,14 +13,18 @@ COPY tests/ ./tests/
 COPY LICENSE ./
 COPY auth.example.json ./
 
-# Create directory for persistent auth data
-RUN mkdir -p /app/data
+# Create directory for persistent auth data and fix ownership for non-root user
+RUN mkdir -p /app/data && chown -R node:node /app/data
 
 # Environment defaults
 ENV PORT=9655
 ENV HOST=0.0.0.0
 ENV DEEPSEEK_AUTH_DIR=/app/data
+ENV SESSIONS_CACHE_PATH=/app/sessions-cache.json
 ENV NON_INTERACTIVE=1
+
+# Switch to non-root user for security
+USER node
 
 EXPOSE 9655
 
