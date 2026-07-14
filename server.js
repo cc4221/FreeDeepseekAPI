@@ -431,6 +431,7 @@ function createSession() {
         messageCount: 0,
         accountId: null,
         history: [],
+        modelId: null, // Запоминаем модель, для которой создан этот чат
     };
 }
 
@@ -1649,9 +1650,23 @@ function formatMessages(messages, tools) {
 
     // Build full conversation history for DeepSeek's context
     let conversation = '';
-    for (const msg of messages) {
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
         if (msg.role === 'system') continue;  // already in systemPrompt
-        const content = normalizeMessageContent(msg.content);
+        
+        let content = normalizeMessageContent(msg.content);
+        const isLastMessage = (i === messages.length - 1);
+
+        // Нейтрализуем старые призывы к анализу картинок в предыстории для не-vision моделей,
+        // чтобы текстовая модель не зацикливалась на их повторном описании.
+        if (!isLastMessage && content) {
+            if (content.includes('[IMAGE:') || /опиши|что (нарисовано|на картинке|на фото|тут происходит)|describe|what is/i.test(content)) {
+                content = content.replace(/\[IMAGE:[^\]]+\]/g, '[Изображение (уже успешно проанализировано в прошлых ходах)]');
+                content = content.replace(/describe this image in detail/gi, 'Запрос на анализ изображения');
+                content = content.replace(/опиши это изображение|что на картинке|что тут происходит/gi, 'Запрос на описание картинки');
+            }
+        }
+
         if (msg.role === 'user' && content) {
             conversation += `User: ${content}\n\n`;
         } else if (msg.role === 'assistant') {
@@ -1816,6 +1831,16 @@ const server = http.createServer(async (req, res) => {
             const stream = params.stream === true;
             const session = getOrCreateAgentSession(agentId);
 
+            // Если модель запроса изменилась (например, с deepseek-vision на deepseek-v4-pro или наоборот),
+            // принудительно сбрасываем сессию, чтобы начать новый чистый чат без блокировки режима.
+            if (session.id && session.modelId && session.modelId !== requestedModel) {
+                console.log(`${agentTag} Model changed from ${session.modelId} to ${requestedModel}. Recreating session to prevent DeepSeek mode lock.`);
+                session.id = null;
+                session.parentMessageId = null;
+                session.createdAt = null;
+                session.messageCount = 0;
+            }
+
             const { prompt, systemPrompt } = formatMessages(messages, tools);
 
             let historyPrefix = '';
@@ -1832,6 +1857,11 @@ const server = http.createServer(async (req, res) => {
 
             const startTime = Date.now();
             const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel, refFileIds);
+            
+            // Если сессия успешно создана или используется, привязываем её к текущей модели
+            if (session.id) {
+                session.modelId = requestedModel;
+            }
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
             async function readDeepSeekResponse(readable) {
