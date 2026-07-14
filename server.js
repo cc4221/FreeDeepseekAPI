@@ -1926,10 +1926,13 @@ const server = http.createServer(async (req, res) => {
                     if (rawText.trim().startsWith('{')) {
                         try {
                             const errJson = JSON.parse(rawText.trim());
+                            const bizMsg = errJson?.data?.biz_msg || errJson?.msg || '';
+                            const isInvalidSession = String(bizMsg).includes('invalid chat session id') || String(rawText).includes('invalid chat session id');
                             modelError = {
                                 type: errJson.err_code || errJson.code || 'api_error',
                                 content: errJson.message || errJson.msg || rawText,
-                                finish_reason: 'error'
+                                finish_reason: 'error',
+                                isInvalidSession: isInvalidSession
                             };
                         } catch (e) {}
                     }
@@ -1952,9 +1955,19 @@ const server = http.createServer(async (req, res) => {
             console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
 
             if ((!fullContent || fullContent.trim().length === 0) && modelError) {
-                res.writeHead(502, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: { message: modelError.content || 'DeepSeek returned an error without content', type: modelError.finish_reason || modelError.type || 'deepseek_model_error', model: requestedModel, real_model: resolveModelConfig(requestedModel).real_model } }));
-                return;
+                const isInvalidSession = modelError.isInvalidSession || String(modelError.content).includes('invalid chat session id');
+                if (isInvalidSession) {
+                    console.log(`${agentTag} Detected invalid chat session ID in modelError. Clearing session in memory and proceeding to automatic retry loop...`);
+                    session.id = null;
+                    session.parentMessageId = null;
+                    session.createdAt = null;
+                    session.messageCount = 0;
+                    modelError = null;
+                } else {
+                    res.writeHead(502, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: { message: modelError.content || 'DeepSeek returned an error without content', type: modelError.finish_reason || modelError.type || 'deepseek_model_error', model: requestedModel, real_model: resolveModelConfig(requestedModel).real_model } }));
+                    return;
+                }
             }
 
             // Empty response — retry loop with fresh sessions
