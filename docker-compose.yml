@@ -1,0 +1,31 @@
+services:
+  deepseek-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: free-deepseek-api
+    restart: unless-stopped
+    ports:
+      - "${PORT:-9655}:9655"
+    environment:
+      - PORT=${PORT:-9655}
+      - HOST=0.0.0.0
+      - DEEPSEEK_AUTH_PATH=/app/data/deepseek-auth.json
+      - NON_INTERACTIVE=1
+      - SKIP_ACCOUNT_MENU=1
+      - DEEPSEEK_ACCOUNT_COOLDOWN_MS=${DEEPSEEK_ACCOUNT_COOLDOWN_MS:-600000}
+    volumes:
+      # Mount auth file directly from host
+      - ./deepseek-auth.json:/app/data/deepseek-auth.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9655/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+

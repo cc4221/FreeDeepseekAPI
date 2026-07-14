@@ -70,7 +70,7 @@ function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         "x-client-platform": "web",
-        "x-client-version": "2.0.0",
+        "x-client-version": "2.0.2",
         "x-client-locale": "ru",
         "x-client-timezone-offset": "14400",
         "x-app-version": "2.0.0",
@@ -187,6 +187,240 @@ async function readDeepSeekJsonResponse(resp, label, account) {
     if (!resp.ok) markAccountFailure(account, resp.status, label);
     return { json, text };
 }
+
+function guessExtension(mimeType) {
+    const map = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif', 'image/bmp': 'bmp' };
+    return map[mimeType] || 'png';
+}
+
+function buildMultipartBody(fields, binaryParts) {
+    const boundary = '----FormBoundary' + Math.random().toString(36).substring(2, 14);
+    const CRLF = '\r\n';
+    const chunks = [];
+    for (const [name, value] of Object.entries(fields || {})) {
+        chunks.push(Buffer.from(`--${boundary}${CRLF}Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}`));
+        chunks.push(Buffer.from(String(value)));
+        chunks.push(Buffer.from(CRLF));
+    }
+    for (const part of (binaryParts || [])) {
+        const filename = part.filename || `file.${guessExtension(part.mimeType)}`;
+        const disposition = `Content-Disposition: form-data; name="${part.name}"; filename="${filename}"${CRLF}`;
+        const headerLines = [
+            disposition,
+            `Content-Type: ${part.mimeType || 'application/octet-stream'}${CRLF}`
+        ];
+        chunks.push(Buffer.from(`--${boundary}${CRLF}`));
+        chunks.push(Buffer.from(headerLines.join('')));
+        chunks.push(Buffer.from(CRLF));
+        chunks.push(Buffer.from(part.buffer));
+        chunks.push(Buffer.from(CRLF));
+    }
+    chunks.push(Buffer.from(`--${boundary}--${CRLF}`));
+    const body = Buffer.concat(chunks);
+    return { body, contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+async function extractImagesFromMessages(messages) {
+    const images = [];
+    for (const msg of messages) {
+        if (!msg || !Array.isArray(msg.content)) continue;
+        for (let p = 0; p < msg.content.length; p++) {
+            const part = msg.content[p];
+            if (!part || typeof part !== 'object') continue;
+            let mimeType = null;
+            let buffer = null;
+            if (part.type === 'image_url' && part.image_url && part.image_url.url) {
+                const url = part.image_url.url.trim();
+                if (url.startsWith('data:')) {
+                    const mimeMatch = url.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/);
+                    mimeType = mimeMatch ? mimeMatch[1] : 'image/png';
+                    const b64 = url.split(',')[1] || '';
+                    if (b64) {
+                        try { buffer = Buffer.from(b64, 'base64'); } catch (e) { console.log(`[vision] Failed to decode base64 image: ${e.message}`); }
+                    }
+                } else if (/^https?:\/\//i.test(url)) {
+                    try {
+                        const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+                        if (resp.ok) {
+                            const ct = resp.headers.get('content-type') || '';
+                            mimeType = ct.startsWith('image/') ? ct.split(';')[0].trim() : 'image/png';
+                            buffer = Buffer.from(await resp.arrayBuffer());
+                        }
+                    } catch (e) { console.log(`[vision] Failed to fetch remote image ${url}: ${e.message}`); }
+                }
+            } else if (part.type === 'image' && part.source) {
+                if (part.source.data) {
+                    const data = part.source.data;
+                    mimeType = part.source.media_type || 'image/png';
+                    let b64 = data;
+                    if (data.startsWith('data:')) {
+                        const mimeMatch = data.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/);
+                        if (mimeMatch) mimeType = mimeMatch[1];
+                        b64 = data.split(',')[1] || '';
+                    }
+                    if (b64) {
+                        try { buffer = Buffer.from(b64, 'base64'); } catch (e) { console.log(`[vision] Failed to decode base64 image: ${e.message}`); }
+                    }
+                } else if (part.source.url && /^https?:\/\//i.test(part.source.url)) {
+                    try {
+                        const resp = await fetch(part.source.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+                        if (resp.ok) {
+                            const ct = resp.headers.get('content-type') || '';
+                            mimeType = part.source.media_type || (ct.startsWith('image/') ? ct.split(';')[0].trim() : 'image/png');
+                            buffer = Buffer.from(await resp.arrayBuffer());
+                        }
+                    } catch (e) { console.log(`[vision] Failed to fetch remote image ${part.source.url}: ${e.message}`); }
+                }
+            }
+            if (buffer && buffer.length > 0) {
+                images.push({ mimeType, buffer });
+                msg.content[p] = { type: 'text', text: `[IMAGE:${mimeType}]` };
+            }
+        }
+    }
+    return images;
+}
+
+async function uploadFileToDeepSeek(account, buffer, mimeType, agentTag) {
+    const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
+        method: 'POST',
+        headers: account.headers,
+        body: JSON.stringify({ target_path: '/api/v0/file/upload_file' })
+    });
+    const chalText = await cr.text();
+    if (!cr.ok) {
+        throw new Error(`PoW challenge for upload failed (HTTP ${cr.status}): ${chalText.substring(0, 100)}`);
+    }
+    let chalJson;
+    try { chalJson = JSON.parse(chalText); }
+    catch (e) { throw new Error(`Non-JSON PoW response for upload: ${chalText.substring(0, 100)}`); }
+    const challenge = chalJson?.data?.biz_data?.challenge;
+    if (!challenge) {
+        throw new Error('PoW challenge for upload returned empty data');
+    }
+    const answer = await solvePOW(challenge, account.config);
+    const powB64 = Buffer.from(JSON.stringify({
+        algorithm: challenge.algorithm,
+        challenge: challenge.challenge,
+        salt: challenge.salt,
+        answer: answer,
+        signature: challenge.signature,
+        target_path: '/api/v0/file/upload_file'
+    })).toString('base64');
+    const { body, contentType } = buildMultipartBody({}, [{
+        name: 'file',
+        filename: `upload.${guessExtension(mimeType)}`,
+        mimeType,
+        buffer
+    }]);
+    const headers = { ...account.headers, 'Content-Type': contentType, 'X-DS-PoW-Response': powB64 };
+    const resp = await fetch('https://chat.deepseek.com/api/v0/file/upload_file', {
+        method: 'POST',
+        headers,
+        body
+    });
+    const { json, text } = await readDeepSeekJsonResponse(resp, 'file upload', account);
+    if (!resp.ok) {
+        throw new Error(`File upload failed (HTTP ${resp.status}): ${text.substring(0, 200)}`);
+    }
+    const fileId = json?.data?.biz_data?.file_id || json?.data?.file_id || json?.file_id || json?.data?.biz_data?.id || json?.data?.id;
+    if (!fileId) {
+        throw new Error(`File upload returned no file_id. Response: ${text.substring(0, 200)}`);
+    }
+    console.log(`${agentTag} Uploaded file: ${fileId}`);
+    return fileId;
+}
+
+async function forkFileForVision(account, fileId, agentTag) {
+    const headers = { ...account.headers, 'Content-Type': 'application/json' };
+    const resp = await fetch('https://chat.deepseek.com/api/v0/file/fork_file_task', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ 
+            file_id: fileId, 
+            target_model: 'vision',    // Для обратной совместимости
+            to_model_type: 'vision'    // Новое обязательное поле бэкэнда
+        })
+    });
+    const { json, text } = await readDeepSeekJsonResponse(resp, 'file fork', account);
+    if (!resp.ok) {
+        throw new Error(`File fork failed (HTTP ${resp.status}): ${text.substring(0, 200)}`);
+    }
+    
+    let forkedId = json?.data?.biz_data?.file_id || json?.data?.file_id || json?.file_id || json?.data?.biz_data?.id || json?.data?.id;
+    
+    if (!forkedId && json?.data?.task_id) {
+        const taskId = json.data.task_id;
+        console.log(`${agentTag} Fork task started: ${taskId}, polling task...`);
+        const maxAttempts = 20;
+        const intervalMs = 500;
+        for (let i = 0; i < maxAttempts; i++) {
+            await new Promise(r => setTimeout(r, intervalMs));
+            // ОПРОС СТАТУСА ЗАДАЧИ: Используем метод GET и query string
+            const pollUrl = `https://chat.deepseek.com/api/v0/file/fetch_files?task_id=${encodeURIComponent(taskId)}`;
+            const pollResp = await fetch(pollUrl, {
+                method: 'GET',
+                headers
+            });
+            const pollText = await pollResp.text();
+            let pollJson = null;
+            try { pollJson = JSON.parse(pollText); } catch (e) {}
+            if (pollResp.ok && pollJson) {
+                forkedId = pollJson?.data?.biz_data?.id || pollJson?.data?.file_id || pollJson?.data?.id;
+                if (forkedId) {
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (!forkedId) {
+        throw new Error(`File fork returned no file_id. Response: ${text.substring(0, 200)}`);
+    }
+
+    // ОПРОС СТАТУСА ФАЙЛА: Используем метод GET и query string с file_ids
+    console.log(`${agentTag} Verifying file readiness for ${forkedId}...`);
+    const maxStatusAttempts = 30;
+    const statusIntervalMs = 500;
+    let isReady = false;
+
+    for (let i = 0; i < maxStatusAttempts; i++) {
+        const pollUrl = `https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=${encodeURIComponent(forkedId)}`;
+        const pollResp = await fetch(pollUrl, {
+            method: 'GET',
+            headers
+        });
+        const pollText = await pollResp.text();
+        let pollJson = null;
+        try { pollJson = JSON.parse(pollText); } catch (e) {}
+
+        if (pollResp.ok && pollJson) {
+            const files = pollJson?.data?.biz_data?.files || pollJson?.data?.files || [];
+            const targetFile = files.find(f => f.id === forkedId);
+            const status = targetFile?.status || '';
+
+            console.log(`${agentTag} File status check ${i + 1}/${maxStatusAttempts}: ${status || 'unknown'}`);
+
+            if (status === 'SUCCESS') {
+                isReady = true;
+                break;
+            } else if (status === 'FAILED') {
+                throw new Error(`DeepSeek backend failed to process image (status: FAILED)`);
+            }
+        } else {
+            console.log(`${agentTag} File status fetch failed (HTTP ${pollResp.status})`);
+        }
+        await new Promise(r => setTimeout(r, statusIntervalMs));
+    }
+
+    if (!isReady) {
+        throw new Error(`Timeout waiting for file status SUCCESS (current state remains unfinished)`);
+    }
+
+    console.log(`${agentTag} Forked file for vision is ready: ${forkedId}`);
+    return forkedId;
+}
+
 loadDeepSeekConfig({ fatal: false });
 
 function createSession() {
@@ -310,10 +544,9 @@ const MODEL_CONFIGS = {
     },
     'deepseek-vision': {
         model_type: 'vision', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek Web “Распознавание” / image understanding beta',
+        real_model: 'DeepSeek Web "Распознавание" / image understanding beta',
         capabilities: { reasoning: false, web_search: false, files: true, vision: true },
-        supported: false,
-        unavailable_reason: 'Current Web API returns: Vision is temporarily unavailable (backend_err_by_model).',
+        supported: true,
     },
 };
 
@@ -336,13 +569,15 @@ function resolveModelConfig(model) {
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
+async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', refFileIds = []) {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
     const account = selectAccountForSession(session);
     const dsHeaders = account.headers;
     account.lastUsedAt = Date.now();
     const agentTag = `[${agentId}/acct:${account.id}]`;
+
+    const searchEnabled = modelCfg.model_type === 'vision' ? false : modelCfg.search_enabled;
 
     // Auto-reset on deep message chain
     if (session.id && session.messageCount >= MAX_MESSAGE_DEPTH) {
@@ -412,8 +647,8 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             chat_session_id: session.id,
             parent_message_id: session.parentMessageId,
             model_type: modelCfg.model_type,
-            prompt: prompt, ref_file_ids: [],
-            thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
+            prompt: prompt, ref_file_ids: refFileIds,
+            thinking_enabled: modelCfg.thinking_enabled, search_enabled: searchEnabled,
             action: null, preempt: false,
         })
     });
@@ -456,8 +691,8 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
                     chat_session_id: session.id,
                     parent_message_id: null,
                     model_type: modelCfg.model_type,
-                    prompt: prompt, ref_file_ids: [],
-                    thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
+                    prompt: prompt, ref_file_ids: refFileIds,
+                    thinking_enabled: modelCfg.thinking_enabled, search_enabled: searchEnabled,
                     action: null, preempt: false,
                 })
             });
@@ -521,6 +756,191 @@ function extractBalancedJsonAt(text, startIndex) {
     return null;
 }
 
+/**
+ * Attempt to extract a balanced JSON object, tolerating unescaped quotes
+ * inside string values (common LLM failure mode).
+ * Strategy: when we hit a quote that would break the string, look ahead to
+ * see if it looks like an HTML attribute (e.g. class="...") and skip past it.
+ */
+function extractBalancedJsonAtLenient(text, startIndex) {
+    // First try strict extraction
+    const strict = extractBalancedJsonAt(text, startIndex);
+    if (strict) return strict;
+
+    // Lenient mode: track brace depth, but when we encounter a quote that
+    // doesn't close properly, try to skip to the matching quote.
+    let braceDepth = 0;
+    let inString = false;
+    let escape = false;
+    let result = '';
+
+    for (let i = startIndex; i < text.length; i++) {
+        const ch = text[i];
+        result += ch;
+
+        if (escape) { escape = false; continue; }
+        if (ch === '\\' && inString) { escape = true; continue; }
+
+        if (ch === '"') {
+            if (!inString) {
+                inString = true;
+                continue;
+            }
+            // Check if this quote actually closes the string.
+            // Look ahead: if next non-space char is , ] } or another structural
+            // char, this is a real closing quote.
+            let j = i + 1;
+            while (j < text.length && text[j] === ' ') j++;
+            const nextCh = text[j];
+            if (nextCh === ',' || nextCh === '}' || nextCh === ']' || nextCh === '\n' || nextCh === undefined) {
+                inString = false;
+                continue;
+            }
+            // This looks like an unescaped quote inside a string value
+            // (e.g. class="foo" inside a JSON string). Skip ahead to find
+            // the real closing quote.
+            const realClose = findRealClosingQuote(text, i + 1);
+            if (realClose !== -1) {
+                // Append everything from i+1 to realClose (inclusive)
+                result += text.substring(i + 1, realClose + 1);
+                i = realClose;
+                inString = false;
+            }
+            continue;
+        }
+
+        if (!inString) {
+            if (ch === '{') braceDepth++;
+            if (ch === '}') {
+                braceDepth--;
+                if (braceDepth === 0) return result;
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Given text after an unescaped opening quote, find the real closing quote
+ * that ends the JSON string value.
+ */
+function findRealClosingQuote(text, startFrom) {
+    // Look for the pattern: quote followed by structural chars (,}]) or end of line
+    for (let i = startFrom; i < text.length; i++) {
+        if (text[i] === '"') {
+            let j = i + 1;
+            while (j < text.length && text[j] === ' ') j++;
+            const nextCh = text[j];
+            if (nextCh === ',' || nextCh === '}' || nextCh === ']' || nextCh === '\n' || nextCh === undefined) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+/**
+ * Attempt to fix common JSON issues from LLM output:
+ * - Unescaped quotes inside string values (HTML attributes like class="foo")
+ * - Trailing commas before } or ]
+ *
+ * Strategy: track brace/bracket depth and string state. When we encounter
+ * a quote that doesn't close the string (next char after quote is not a
+ * structural char), escape it.
+ */
+function sanitizeJsonString(raw) {
+    if (!raw) return raw;
+
+    // Quick check: if it's already valid JSON, return as-is
+    try {
+        JSON.parse(raw);
+        return raw;
+    } catch (e) {
+        // Need to fix
+    }
+
+    let result = '';
+    let inString = false;
+    let escape = false;
+    let braceDepth = 0;
+    let bracketDepth = 0;
+
+    for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+        const nextCh = raw[i + 1];
+
+        if (escape) {
+            result += ch;
+            escape = false;
+            continue;
+        }
+
+        if (ch === '\\') {
+            // Check if this is escaping a quote inside a string
+            if (inString && nextCh === '"') {
+                result += '\\"';
+                i++; // skip the quote
+                continue;
+            }
+            // Check if this is a literal \n (backslash followed by n)
+            if (nextCh === 'n' && inString) {
+                result += '\\n';
+                i++; // skip the n
+                continue;
+            }
+            result += ch;
+            if (inString) escape = true;
+            continue;
+        }
+
+        if (ch === '"') {
+            if (!inString) {
+                inString = true;
+                result += ch;
+                continue;
+            }
+
+            // We're in a string and hit a quote. Is this the closing quote?
+            // Look ahead past whitespace
+            let j = i + 1;
+            while (j < raw.length && (raw[j] === ' ' || raw[j] === '\t' || raw[j] === '\n' || raw[j] === '\r')) j++;
+
+            const afterQuote = raw[j];
+
+            // Closing quote if followed by: , : } ] or end of string
+            // Also closing if followed by another key-value pair
+            if (afterQuote === ',' || afterQuote === '}' || afterQuote === ']' ||
+                afterQuote === ':' || afterQuote === undefined || afterQuote === '\n') {
+                inString = false;
+                result += ch;
+                continue;
+            }
+
+            // Not a closing quote — escape it
+            result += '\\' + ch;
+            continue;
+        }
+
+        // Track depth for structural chars outside strings
+        if (!inString) {
+            if (ch === '{') braceDepth++;
+            if (ch === '}') braceDepth--;
+            if (ch === '[') bracketDepth++;
+            if (ch === ']') bracketDepth--;
+
+            // Remove trailing commas before } or ]
+            if ((ch === '}' || ch === ']') && result.trimEnd().endsWith(',')) {
+                const trimmed = result.trimEnd();
+                result = trimmed.slice(0, -1);
+            }
+        }
+
+        result += ch;
+    }
+
+    return result;
+}
+
 function coerceToolCallObject(obj) {
     if (!obj || typeof obj !== 'object') return null;
     const candidate = obj.tool_call || obj.tool || obj.function_call || obj;
@@ -538,6 +958,8 @@ function coerceToolCallObject(obj) {
 
 function parseJsonToolCandidate(raw, label = 'json') {
     if (!raw) return null;
+
+    // Try strict parse first
     try {
         const parsed = JSON.parse(raw);
         const tc = coerceToolCallObject(parsed);
@@ -546,9 +968,127 @@ function parseJsonToolCandidate(raw, label = 'json') {
             return tc;
         }
     } catch (e) {
-        console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
+        // Strict parse failed, try sanitized version
     }
+
+    // Try with sanitized JSON (fix unescaped quotes, trailing commas)
+    try {
+        const sanitized = sanitizeJsonString(raw);
+        const parsed = JSON.parse(sanitized);
+        const tc = coerceToolCallObject(parsed);
+        if (tc) {
+            console.log(`[parseToolCall] SUCCESS ${label} (sanitized): ${tc.name} (args=${tc.arguments.length} chars)`);
+            return tc;
+        }
+    } catch (e) {
+        // Fall through to regex extraction
+    }
+
+    // Last resort: regex extraction for common tool call patterns
+    // Handles cases where JSON is too broken to parse even with sanitization
+    const regexTc = extractToolCallViaRegex(raw, label);
+    if (regexTc) return regexTc;
+
+    console.log(`[parseToolCall] ${label} JSON.parse failed`);
     return null;
+}
+
+/**
+ * Extract tool call info via regex when JSON parsing fails completely.
+ * Handles the common LLM output format:
+ * {"tool_call":{"name":"func_name","arguments":{"key":"value",...}}}
+ * Also handles: {"name":"func_name","arguments":{...}}
+ */
+function extractToolCallViaRegex(raw, label = 'regex') {
+    // Pattern 1: {"tool_call":{"name":"...","arguments":{...}}}
+    // Pattern 2: {"name":"...","arguments":{...}}
+    // We need to find the name and then extract arguments as best we can
+
+    // Find the function name - try multiple patterns
+    const namePatterns = [
+        /["']tool_call["']\s*:\s*\{[^}]*?["']name["']\s*:\s*["']([^"']+)["']/,
+        /["']name["']\s*:\s*["']([^"']+)["']/,
+        /["']tool["']\s*:\s*["']([^"']+)["']/,
+        /["']function_call["']\s*:\s*\{[^}]*?["']name["']\s*:\s*["']([^"']+)["']/,
+    ];
+
+    let name = null;
+    for (const pattern of namePatterns) {
+        const match = raw.match(pattern);
+        if (match) {
+            name = match[1];
+            break;
+        }
+    }
+
+    if (!name) return null;
+
+    // Find the arguments object - look for "arguments":{...} or "arguments": {...}
+    const argsMatch = raw.match(/["']?arguments["']?\s*:\s*(\{[\s\S]*\})/);
+    if (!argsMatch) {
+        // No arguments found, return with empty args
+        console.log(`[parseToolCall] SUCCESS ${label} (name only): ${name}`);
+        return { name, arguments: '{}' };
+    }
+
+    let argsStr = argsMatch[1];
+
+    // Try to fix the arguments JSON
+    try {
+        // First try as-is
+        JSON.parse(argsStr);
+    } catch (e) {
+        // Try sanitizing
+        try {
+            argsStr = sanitizeJsonString(argsStr);
+            JSON.parse(argsStr);
+        } catch (e2) {
+            // Try extracting key-value pairs via regex
+            const args = extractJsonArgsViaRegex(argsStr);
+            if (args) {
+                console.log(`[parseToolCall] SUCCESS ${label} (regex args): ${name}`);
+                return { name, arguments: JSON.stringify(args) };
+            }
+            // Give up, return raw args as string
+            console.log(`[parseToolCall] SUCCESS ${label} (raw args): ${name}`);
+            return { name, arguments: JSON.stringify({ raw: argsStr }) };
+        }
+    }
+
+    console.log(`[parseToolCall] SUCCESS ${label}: ${name}`);
+    return { name, arguments: argsStr };
+}
+
+/**
+ * Extract JSON object key-value pairs via regex when JSON parsing fails.
+ * Handles: "key": "value", "key": {nested}, "key": [array], "key": number
+ */
+function extractJsonArgsViaRegex(argsStr) {
+    const result = {};
+
+    // Match "key": value patterns
+    // Value can be: "string", {object}, [array], number, true, false, null
+    const kvPattern = /["']?(\w+)["']?\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\{[\s\S]*?\}|\[[\s\S]*?\]|-?\d+\.?\d*|true|false|null)/g;
+
+    let match;
+    while ((match = kvPattern.exec(argsStr)) !== null) {
+        const key = match[1];
+        let value = match[2].trim();
+
+        // Try to parse the value
+        try {
+            result[key] = JSON.parse(value);
+        } catch (e) {
+            // If it's a string without quotes, add them
+            if (!value.startsWith('"') && !value.startsWith('{') && !value.startsWith('[')) {
+                result[key] = value;
+            } else {
+                result[key] = value;
+            }
+        }
+    }
+
+    return Object.keys(result).length > 0 ? result : null;
 }
 
 function parseToolCall(text) {
@@ -562,11 +1102,17 @@ function parseToolCall(text) {
         if (tc) return tc;
     }
 
-    // Fenced JSON blocks.
+    // Fenced JSON blocks — only try blocks that look like tool calls
+    // (contain "tool_call", "name", "arguments" etc.)
     const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
     let fence;
     while ((fence = fenceRe.exec(text)) !== null) {
-        const tc = parseJsonToolCandidate(fence[1].trim(), 'fenced');
+        const content = fence[1].trim();
+        // Skip blocks that are clearly code (start with <, import, const, etc.)
+        if (/^[<]/.test(content)) continue;  // HTML/Vue templates
+        if (/^(import|const|let|var|function|class|export|type|interface)\s/m.test(content)) continue;  // JS/TS code
+        if (!content.includes('{')) continue;  // No JSON at all
+        const tc = parseJsonToolCandidate(content, 'fenced');
         if (tc) return tc;
     }
 
@@ -577,17 +1123,17 @@ function parseToolCall(text) {
         const afterMatch = text.substring(match.index + match[0].length);
         const braceIdx = afterMatch.indexOf('{');
         if (braceIdx !== -1) {
-            const rawJson = extractBalancedJsonAt(afterMatch, braceIdx);
+            // Try lenient extraction first (handles unescaped quotes)
+            const rawJson = extractBalancedJsonAtLenient(afterMatch, braceIdx);
             if (rawJson) {
                 try {
-                    const args = JSON.parse(rawJson);
+                    const sanitized = sanitizeJsonString(rawJson);
+                    const args = JSON.parse(sanitized);
                     console.log(`[parseToolCall] SUCCESS legacy: ${name} (args=${rawJson.length} chars)`);
                     return { name, arguments: JSON.stringify(args) };
                 } catch (e) {
                     console.log(`[parseToolCall] legacy JSON.parse failed: ${e.message.substring(0,100)}`);
                 }
-            } else {
-                console.log(`[parseToolCall] TOOL_CALL:${name} found but JSON braces are unbalanced`);
             }
         } else {
             console.log(`[parseToolCall] TOOL_CALL:${name} found but no { after it`);
@@ -596,16 +1142,68 @@ function parseToolCall(text) {
 
     // First balanced JSON object in the whole response. Supports:
     // {"tool_call":{"name":"...","arguments":{...}}}, {"name":"...","arguments":{...}}, etc.
+    // Try lenient extraction for inline JSON (handles unescaped quotes in HTML attributes)
     for (let i = 0; i < text.length; i++) {
         if (text[i] !== '{') continue;
-        const rawJson = extractBalancedJsonAt(text, i);
+        // Try strict first, then lenient
+        let rawJson = extractBalancedJsonAt(text, i);
+        if (!rawJson) {
+            rawJson = extractBalancedJsonAtLenient(text, i);
+        }
         if (!rawJson) continue;
         const tc = parseJsonToolCandidate(rawJson, 'inline');
         if (tc) return tc;
     }
 
+    // Last resort: try regex extraction on the entire text
+    // This handles cases where JSON is too broken for any JSON.parse attempt
+    const regexResult = extractToolCallViaRegex(text, 'inline-regex');
+    if (regexResult) return regexResult;
+
     console.log(`[parseToolCall] No tool call match in ${text.length} chars`);
     return null;
+}
+
+/**
+ * Parse multiple tool calls from a single response.
+ * Returns array of tool calls found.
+ */
+function parseMultipleToolCalls(text) {
+    if (!text || typeof text !== 'string') return [];
+
+    const toolCalls = [];
+    let searchFrom = 0;
+
+    while (searchFrom < text.length) {
+        // Find next { that could start a JSON object
+        const braceIdx = text.indexOf('{', searchFrom);
+        if (braceIdx === -1) break;
+
+        // Try to extract a balanced JSON object
+        let rawJson = extractBalancedJsonAt(text, braceIdx);
+        if (!rawJson) {
+            rawJson = extractBalancedJsonAtLenient(text, braceIdx);
+        }
+        if (!rawJson) {
+            searchFrom = braceIdx + 1;
+            continue;
+        }
+
+        const tc = parseJsonToolCandidate(rawJson, 'multi');
+        if (tc) {
+            toolCalls.push(tc);
+            // Continue searching after this JSON object
+            searchFrom = braceIdx + rawJson.length;
+        } else {
+            searchFrom = braceIdx + 1;
+        }
+    }
+
+    if (toolCalls.length > 0) {
+        console.log(`[parseToolCall] Found ${toolCalls.length} tool call(s): ${toolCalls.map(tc => tc.name).join(', ')}`);
+    }
+
+    return toolCalls;
 }
 
 /**
@@ -689,9 +1287,19 @@ function normalizeMessageContent(content) {
             if (typeof part === 'string') return part;
             if (!part || typeof part !== 'object') return '';
             if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') return part.text || '';
-            if (part.type === 'tool_result') return `[Tool Result ${part.tool_use_id || ''}]\n${normalizeMessageContent(part.content)}`;
+            if (part.type === 'tool_result') {
+                const inner = part.content || '';
+                return `[Tool Result${part.tool_use_id ? ' ' + part.tool_use_id : ''}]\n${normalizeMessageContent(inner)}`;
+            }
+            if (part.type === 'tool_use') return `[Tool: ${part.name || ''}]`;
             if (part.type === 'image_url') return `[Image: ${part.image_url?.url || ''}]`;
-            return part.text || part.content || JSON.stringify(part);
+            if (part.type === 'image') return `[Image: ${part.source?.data ? part.source.data.substring(0, 80) + '...' : ''}]`;
+            if (part.type === 'input_json_delta') return '';
+            if (part.type === 'content_block_delta') return '';
+            // Fallback: try common fields
+            if (part.text) return part.text;
+            if (part.content) return normalizeMessageContent(part.content);
+            return '';
         }).filter(Boolean).join('\n');
     }
     return String(content);
@@ -779,7 +1387,12 @@ function normalizeApiParams(params, apiMode) {
             user: params.user,
         };
     }
-    return params;
+    // OpenAI mode: normalize message content (array → string) for all messages
+    const normalizedMessages = (params.messages || []).map(msg => ({
+        ...msg,
+        content: normalizeMessageContent(msg.content)
+    }));
+    return { ...params, messages: normalizedMessages };
 }
 
 function safeJsonParseObject(text, fallback = {}) {
@@ -1011,7 +1624,7 @@ function extractScreenshotPaths(messages) {
         // Check user/assistant messages for paths mentioned in conversation text
         // Only include if the file ACTUALLY EXISTS (DeepSeek hallucinates paths)
         if ((msg.role === 'user' || msg.role === 'assistant') && msg.content) {
-            const content = typeof msg.content === 'string' ? msg.content : '';
+            const content = normalizeMessageContent(msg.content);
             const pathRegex = /(\/[^\s<>"']+\.(?:png|jpg|jpeg|webp|gif))/gi;
             let match;
             while ((match = pathRegex.exec(content)) !== null) {
@@ -1029,7 +1642,7 @@ function formatMessages(messages, tools) {
     let systemPrompt = '';
     for (const msg of messages) {
         if (msg.role === 'system' && msg.content) {
-            systemPrompt += msg.content + '\n';
+            systemPrompt += normalizeMessageContent(msg.content) + '\n';
         }
     }
     systemPrompt += formatToolDefinitions(tools);
@@ -1038,22 +1651,23 @@ function formatMessages(messages, tools) {
     let conversation = '';
     for (const msg of messages) {
         if (msg.role === 'system') continue;  // already in systemPrompt
-        if (msg.role === 'user' && msg.content) {
-            conversation += `User: ${msg.content}\n\n`;
+        const content = normalizeMessageContent(msg.content);
+        if (msg.role === 'user' && content) {
+            conversation += `User: ${content}\n\n`;
         } else if (msg.role === 'assistant') {
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 // This was a tool call response from a previous turn
                 for (const tc of msg.tool_calls) {
                     conversation += `Assistant: TOOL_CALL: ${tc.function.name}\narguments: ${tc.function.arguments}\n\n`;
                 }
-            } else if (msg.content) {
-                conversation += `Assistant: ${msg.content}\n\n`;
+            } else if (content) {
+                conversation += `Assistant: ${content}\n\n`;
             }
-        } else if (msg.role === 'tool' && msg.content) {
+        } else if (msg.role === 'tool' && content) {
             // Tool execution result — send back to DeepSeek as context
-            const truncated = msg.content.length > 8000
-                ? msg.content.substring(0, 8000) + '\n...[truncated]'
-                : msg.content;
+            const truncated = content.length > 8000
+                ? content.substring(0, 8000) + '\n...[truncated]'
+                : content;
             conversation += `[Tool Result]\n${truncated}\n\n`;
         }
     }
@@ -1149,11 +1763,14 @@ const server = http.createServer(async (req, res) => {
     req.on('end', async () => {
         try {
             const rawParams = JSON.parse(body || '{}');
-            const params = normalizeApiParams(rawParams, apiMode);
-            const messages = params.messages || [];
-            const tools = params.tools || [];
-            const stream = params.stream === true;
-            const requestedModel = String(params.model || 'deepseek-chat').toLowerCase();
+            const requestedModel = String(rawParams.model || 'deepseek-chat').toLowerCase();
+            const remoteAddr = req.socket.remoteAddress || 'unknown';
+            const requestedSession = req.headers['x-agent-session'] || rawParams.session || rawParams.user;
+            const agentId = requestedSession
+                ? String(requestedSession)
+                : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
+            const agentTag = `[${agentId}]`;
+
             if (!isKnownModel(requestedModel)) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: { message: `Unknown model: ${requestedModel}`, type: 'invalid_model', supported_models: SUPPORTED_MODEL_IDS, model_capabilities_url: '/v1/model-capabilities' } }));
@@ -1165,25 +1782,48 @@ const server = http.createServer(async (req, res) => {
                 res.end(JSON.stringify({ error: { message: `${requestedModel} is not currently supported through this DeepSeek Web API path`, type: 'unsupported_model', model: requestedModel, real_model: cfg.real_model, reason: cfg.unavailable_reason, capabilities: cfg.capabilities, supported_models: SUPPORTED_MODEL_IDS } }));
                 return;
             }
-            // Use remote IP for session isolation (local gets 'dev-agent', external per-IP)
-            const remoteAddr = req.socket.remoteAddress || 'unknown';
-            const requestedSession = req.headers['x-agent-session'] || params.session || params.user;
-            const agentId = requestedSession
-                ? String(requestedSession)
-                : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
-            const agentTag = `[${agentId}]`;
-            const { prompt, systemPrompt } = formatMessages(messages, tools);
 
+            let refFileIds = [];
+            if (requestedModel === 'deepseek-vision') {
+                const images = await extractImagesFromMessages(rawParams.messages || []);
+                if (images.length === 0) {
+                    res.writeHead(422, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: { message: 'deepseek-vision requires at least one image in messages (image_url or image content block)', type: 'invalid_request', model: requestedModel } }));
+                    return;
+                }
+                console.log(`${agentTag} Vision request: uploading ${images.length} image(s)`);
+                const account = selectAccountForSession(getOrCreateAgentSession(agentId));
+                for (let i = 0; i < images.length; i++) {
+                    const img = images[i];
+                    try {
+                        const uploadedId = await uploadFileToDeepSeek(account, img.buffer, img.mimeType, agentTag);
+                        console.log(`${agentTag} Vision image ${i + 1}/${images.length} uploaded: ${uploadedId}`);
+                        const forkedId = await forkFileForVision(account, uploadedId, agentTag);
+                        console.log(`${agentTag} Vision image ${i + 1}/${images.length} forked: ${forkedId}`);
+                        refFileIds.push(forkedId);
+                    } catch (e) {
+                        console.log(`${agentTag} Vision image ${i + 1}/${images.length} failed: ${e.message}`);
+                        res.writeHead(502, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: { message: `Vision image processing failed: ${e.message}`, type: 'vision_upload_error', model: requestedModel, image_index: i } }));
+                        return;
+                    }
+                }
+            }
+
+            const params = normalizeApiParams(rawParams, apiMode);
+            const messages = params.messages || [];
+            const tools = params.tools || [];
+            const stream = params.stream === true;
             const session = getOrCreateAgentSession(agentId);
 
-            // Build history prefix if starting fresh
+            const { prompt, systemPrompt } = formatMessages(messages, tools);
+
             let historyPrefix = '';
             if (!session.id && session.history.length > 0) {
-                historyPrefix = '[Previous conversation]\n';
                 for (const exchange of session.history) {
                     historyPrefix += `User: ${exchange.user}\nAssistant: ${exchange.assistant}\n\n`;
                 }
-                historyPrefix += '[Continue from here]\n\n';
+                if (historyPrefix) historyPrefix = '[Previous conversation]\n' + historyPrefix + '[Continue from here]\n\n';
             }
 
             const fullPrompt = systemPrompt
@@ -1191,7 +1831,7 @@ const server = http.createServer(async (req, res) => {
                 : `${historyPrefix}${prompt}`;
 
             const startTime = Date.now();
-            const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
+            const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel, refFileIds);
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
             async function readDeepSeekResponse(readable) {
@@ -1203,6 +1843,7 @@ const server = http.createServer(async (req, res) => {
                 let newMessageId = null;
                 let finishReason = null;
                 let modelError = null;
+                let rawBuffer = [];
 
                 const rebuildFragmentText = () => {
                     const responseText = fragments
@@ -1226,6 +1867,7 @@ const server = http.createServer(async (req, res) => {
                 };
 
                 for await (const chunk of readable) {
+                    rawBuffer.push(chunk);
                     buffer += new TextDecoder().decode(chunk, { stream: true });
                     const lines = buffer.split('\n');
                     buffer = lines.pop() || '';
@@ -1275,6 +1917,21 @@ const server = http.createServer(async (req, res) => {
                                 }
                             } catch (e) { }
                         }
+                    }
+                }
+
+                if (!fullContent && rawBuffer.length > 0) {
+                    const rawText = new TextDecoder().decode(Buffer.concat(rawBuffer));
+                    console.log(`${agentTag} RAW COMPLETION RESPONSE (0 parsed chars): ${rawText.substring(0, 1000)}`);
+                    if (rawText.trim().startsWith('{')) {
+                        try {
+                            const errJson = JSON.parse(rawText.trim());
+                            modelError = {
+                                type: errJson.err_code || errJson.code || 'api_error',
+                                content: errJson.message || errJson.msg || rawText,
+                                finish_reason: 'error'
+                            };
+                        } catch (e) {}
                     }
                 }
 
@@ -1328,7 +1985,7 @@ const server = http.createServer(async (req, res) => {
                 session.messageCount = 0;
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(1000 * retryAttempt, 5000)));
-                const { resp: retryResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
+                const { resp: retryResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel, refFileIds);
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryContent = retryResult && retryResult.content ? sanitizeContent(retryResult.content) : '';
                 const retryReasoning = retryResult && retryResult.reasoningContent ? sanitizeContent(retryResult.reasoningContent) : '';
@@ -1347,7 +2004,7 @@ const server = http.createServer(async (req, res) => {
                 continuationRounds++;
                 console.log(`${agentTag} Response ${fullContent.length} chars (finish=${finishReason}). Auto-continuing (${continuationRounds}/${MAX_CONTINUATION})...`);
                 await new Promise(r => setTimeout(r, 500));
-                const { resp: contResp } = await askDeepSeekStream('continue', agentId, requestedModel);
+                const { resp: contResp } = await askDeepSeekStream('continue', agentId, requestedModel, refFileIds);
                 const contResult = await readDeepSeekResponse(contResp.body);
                 const contContent = contResult && contResult.content ? sanitizeContent(contResult.content) : '';
                 const contReasoning = contResult && contResult.reasoningContent ? sanitizeContent(contResult.reasoningContent) : '';
@@ -1363,7 +2020,21 @@ const server = http.createServer(async (req, res) => {
             }
 
             let toolCall = parseToolCall(fullContent);
-            
+
+            // If single parse didn't find anything, try parsing multiple tool calls
+            if (!toolCall) {
+                const multiCalls = parseMultipleToolCalls(fullContent);
+                if (multiCalls.length > 0) {
+                    // Use the first tool call (agents typically execute one at a time)
+                    toolCall = multiCalls[0];
+                    console.log(`${agentTag} Using first of ${multiCalls.length} tool calls: ${toolCall.name}`);
+                    // Store remaining calls count for logging
+                    if (multiCalls.length > 1) {
+                        console.log(`${agentTag} ${multiCalls.length - 1} additional tool call(s) available: ${multiCalls.slice(1).map(tc => tc.name).join(', ')}`);
+                    }
+                }
+            }
+
             // Retry if TOOL_CALL was found but JSON was truncated/invalid
             if (!toolCall && /TOOL_CALL:\s*\w/i.test(fullContent)) {
                 console.log(`${agentTag} TOOL_CALL detected but JSON invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
@@ -1373,7 +2044,7 @@ const server = http.createServer(async (req, res) => {
                 session.messageCount = 0;
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = fullPrompt + '\n\n[STRICT INSTRUCTION] Your previous response had a TOOL_CALL but the arguments were too long and got cut off. Keep the arguments SHORT — no large file contents. Just use a minimal example or reference the file by name. Output ONLY: TOOL_CALL: <function>\narguments: <short JSON>';
-                const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
+                const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel, refFileIds);
                 const retryResult2 = await readDeepSeekResponse(retryResp2.body);
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
@@ -1454,7 +2125,11 @@ function printStatus() {
 
 async function showStartupMenu() {
     if (isTruthy(process.env.SKIP_ACCOUNT_MENU) || isTruthy(process.env.NON_INTERACTIVE)) {
-        if (!hasAuthConfig()) loadDeepSeekConfig({ fatal: true });
+        loadDeepSeekConfig({ fatal: false });
+        if (!hasAuthConfig()) {
+            console.warn('[DS-API] WARNING: No auth config found. Place deepseek-auth.json in the data directory and restart.');
+            console.warn(`[DS-API] Auth search paths: ${discoverAuthPaths().join(', ')}`);
+        }
         return true;
     }
     while (true) {
