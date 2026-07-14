@@ -1837,12 +1837,30 @@ const server = http.createServer(async (req, res) => {
     req.on('end', async () => {
         try {
             const rawParams = JSON.parse(body || '{}');
-            const requestedModel = String(rawParams.model || 'deepseek-chat').toLowerCase();
+            let requestedModel = String(rawParams.model || 'deepseek-chat').toLowerCase();
             const remoteAddr = req.socket.remoteAddress || 'unknown';
             const requestedSession = req.headers['x-agent-session'] || rawParams.session || rawParams.user;
-            const agentId = requestedSession
-                ? String(requestedSession)
-                : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
+            let agentId = 'default';
+
+            if (requestedSession) {
+                agentId = String(requestedSession);
+            } else {
+                const baseIp = (remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1')
+                    ? 'dev-agent'
+                    : remoteAddr;
+
+                const userAgent = req.headers['user-agent'] || '';
+                const authHeader = req.headers['authorization'] || '';
+                let suffix = '';
+                if (userAgent) {
+                    const uaMatch = userAgent.match(/^([a-zA-Z0-9]+)/);
+                    suffix += '_' + (uaMatch ? uaMatch[1] : 'client');
+                }
+                if (authHeader) {
+                    suffix += '_' + authHeader.slice(-6).replace(/[^a-zA-Z0-9]/g, '');
+                }
+                agentId = baseIp + suffix;
+            }
             const agentTag = `[${agentId}]`;
 
             if (!isKnownModel(requestedModel)) {
@@ -1858,6 +1876,17 @@ const server = http.createServer(async (req, res) => {
             }
 
             let refFileIds = [];
+
+            // АВТО-РОУТИНГ: Если клиент просит Expert/Reasoner, но прислал картинку — принудительно меняем на vision
+            const hasImages = (rawParams.messages || []).some(m =>
+                (Array.isArray(m.content) && m.content.some(c => c.type === 'image_url' || c.type === 'image'))
+            );
+
+            if (hasImages && requestedModel !== 'deepseek-vision') {
+                console.log(`[${agentTag}] Vision content detected, routing request from ${requestedModel} to deepseek-vision`);
+                requestedModel = 'deepseek-vision';
+            }
+
             if (requestedModel === 'deepseek-vision') {
                 const images = await extractImagesFromMessages(rawParams.messages || []);
                 if (images.length === 0) {
@@ -2052,12 +2081,23 @@ const server = http.createServer(async (req, res) => {
 
             if ((!fullContent || fullContent.trim().length === 0) && modelError) {
                 const isInvalidSession = modelError.isInvalidSession || String(modelError.content).includes('invalid chat session id');
+                const isExpertBusy = String(modelError.finish_reason || '').includes('expert_busy_use_default') || String(modelError.content || '').includes('Сервер перегружен');
+
                 if (isInvalidSession) {
                     console.log(`${agentTag} Detected invalid chat session ID in modelError. Clearing session in memory and proceeding to automatic retry loop...`);
                     session.id = null;
                     session.parentMessageId = null;
                     session.createdAt = null;
                     session.messageCount = 0;
+                    modelError = null;
+                } else if (isExpertBusy && requestedModel !== 'deepseek-chat') {
+                    console.log(`${agentTag} Expert model is overloaded (expert_busy_use_default). Falling back to deepseek-chat (default model_type)...`);
+                    session.id = null;
+                    session.parentMessageId = null;
+                    session.createdAt = null;
+                    session.messageCount = 0;
+                    requestedModel = 'deepseek-chat';
+                    session.modelId = 'deepseek-chat';
                     modelError = null;
                 } else {
                     res.writeHead(502, { 'Content-Type': 'application/json' });
